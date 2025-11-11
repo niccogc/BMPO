@@ -1,0 +1,16 @@
+# UV virtual environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Aim tracking data
+.aim/
+
+# Nix
+result
+result-*
+
+# Python
+*.egg-info/
+dist/
+.cache/
