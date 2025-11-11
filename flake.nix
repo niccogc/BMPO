@@ -34,33 +34,34 @@
         pythonWithNixPkgs
         pkgs.uv
       ];
-      
+
       shellHook = ''
         # Get the Nix Python site-packages path
         export NIX_PYTHON_SITE_PACKAGES="${pythonWithNixPkgs}/${pythonWithNixPkgs.sitePackages}"
-        
+
         # Create UV venv if it doesn't exist
         if [ ! -d .venv ]; then
           echo "Creating UV virtual environment..."
           uv venv --python ${python}/bin/python
         fi
-        
+
         # Activate the venv
         source .venv/bin/activate
-        
+
         # Add Nix packages to PYTHONPATH so they're available in the venv
         export PYTHONPATH="$NIX_PYTHON_SITE_PACKAGES:$PYTHONPATH"
-        
+
         # Install aim if not already installed
         if ! uv pip list | grep -q "^aim "; then
           echo "Installing aim via UV..."
           uv pip install aim
         fi
-        
+
         echo "✓ Environment ready!"
         echo "  Nix packages: torch, jax, quimb"
         echo "  UV packages: aim"
         echo "  Python: $(which python)"
+        zsh
       '';
     };
   };
