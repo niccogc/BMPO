@@ -42,9 +42,7 @@
               "serena",
               "start-mcp-server",
               "--context",
-              "ide-assistant",
-              "--project",
-              "/etc/nixos/ai"
+              "ide-assistant"
             ],
             "enabled": true
           },
