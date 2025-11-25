@@ -14,3 +14,4 @@ result-*
 *.egg-info/
 dist/
 .cache/
+.serena

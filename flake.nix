@@ -25,8 +25,11 @@
     pythonWithNixPkgs = python.withPackages (ps:
       with ps; [
         torch
-        jax
-        quimb
+        jedi-language-server
+        scipy
+        matplotlib
+        # jax
+        # quimb
       ]);
 
     opencodecfg = pkgs.writeText "opencodecfg.jsonc" ''
@@ -36,7 +39,9 @@
           "serena": {
             "type": "local",
             "command": [
-              "uvx",
+              "${pkgs.uv}/bin/uvx",
+              "--python",
+              "${python}/bin/python",
               "--from",
               "git+https://github.com/oraios/serena",
               "serena",
@@ -73,7 +78,9 @@
           "serena": {
             "type": "local",
             "command": [
-              "uvx",
+              "${pkgs.uv}/bin/uvx",
+              "--python",
+              "${python}/bin/python",
               "--from",
               "git+https://github.com/oraios/serena",
               "serena",
