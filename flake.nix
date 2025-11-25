@@ -104,6 +104,10 @@
     '';
   in {
     devShells.${system}.default = pkgs.mkShell {
+      buildInputs = [
+        pkgs.stdenv.cc.cc.lib
+        pkgs.zlib
+      ];
       packages = [
         pythonWithNixPkgs
         pkgs.uv
@@ -112,6 +116,7 @@
       ];
 
       shellHook = ''
+        export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [pkgs.stdenv.cc.cc.lib pkgs.zlib]}"
         export OPENCODE_CONFIG=${opencodecfg}
         export PROJECT_DIR=$PWD
         export GEMINI_SETTINGS=${geminicfg}
