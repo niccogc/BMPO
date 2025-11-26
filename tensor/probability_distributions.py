@@ -95,6 +95,51 @@ class GammaDistribution:
         # E[log X] = ψ(α) - log(β)
         return torch.digamma(alpha) - torch.log(beta)
 
+    def expected_log_prob(
+        self, 
+        concentration_p: torch.Tensor, 
+        rate_p: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute E_q[log p(X)] where q is self and p is Gamma(concentration_p, rate_p).
+        
+        This computes the expected log probability of X under distribution p,
+        where the expectation is taken with respect to distribution q (self).
+        
+        For X ~ q = Gamma(α_q, β_q) and p = Gamma(α_p, β_p):
+        
+        log p(X) = α_p log β_p - log Γ(α_p) + (α_p - 1) log X - β_p X
+        
+        E_q[log p(X)] = α_p log β_p - log Γ(α_p) + (α_p - 1) E_q[log X] - β_p E_q[X]
+        
+        where:
+        - E_q[log X] = ψ(α_q) - log(β_q)
+        - E_q[X] = α_q / β_q
+        
+        Args:
+            concentration_p: Concentration parameter α_p of distribution p
+            rate_p: Rate parameter β_p of distribution p
+            
+        Returns:
+            E_q[log p(X)]
+        """
+        alpha_p = concentration_p
+        beta_p = rate_p
+        
+        # E_q[log X] using self (q) parameters
+        e_q_log_x = self.expected_log()
+        
+        # E_q[X] using self (q) parameters
+        e_q_x = self.mean()
+        
+        # E_q[log p(X)]
+        result = (alpha_p * torch.log(beta_p) 
+                 - torch.lgamma(alpha_p) 
+                 + (alpha_p - 1) * e_q_log_x 
+                 - beta_p * e_q_x)
+        
+        return result
+
 
 class MultivariateGaussianDistribution:
     """
@@ -206,6 +251,73 @@ class MultivariateGaussianDistribution:
         
         # E[log p(X)] = -entropy
         return -temp_dist.entropy()
+
+    def expected_log_prob(
+        self,
+        loc_p: torch.Tensor,
+        covariance_matrix_p: Optional[torch.Tensor] = None,
+        scale_tril_p: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute E_q[log p(X)] where q is self and p is N(loc_p, Σ_p).
+        
+        This computes the expected log probability of X under distribution p,
+        where the expectation is taken with respect to distribution q (self).
+        
+        For X ~ q = N(μ_q, Σ_q) and p = N(μ_p, Σ_p):
+        
+        log p(X) = -d/2 log(2π) - 1/2 log|Σ_p| - 1/2 (X - μ_p)ᵀ Σ_p⁻¹ (X - μ_p)
+        
+        E_q[log p(X)] = -d/2 log(2π) - 1/2 log|Σ_p| - 1/2 E_q[(X - μ_p)ᵀ Σ_p⁻¹ (X - μ_p)]
+        
+        Using the trace trick:
+        E_q[(X - μ_p)ᵀ Σ_p⁻¹ (X - μ_p)] = tr(Σ_p⁻¹ Σ_q) + (μ_q - μ_p)ᵀ Σ_p⁻¹ (μ_q - μ_p)
+        
+        Args:
+            loc_p: Mean vector μ_p of distribution p
+            covariance_matrix_p: Covariance matrix Σ_p of distribution p
+            scale_tril_p: Cholesky factor of Σ_p (alternative to covariance_matrix_p)
+            
+        Returns:
+            E_q[log p(X)]
+        """
+        # Get q (self) parameters
+        mu_q = self.loc
+        d = mu_q.shape[0]  # Dimensionality
+        
+        # Get Σ_q (q's covariance)
+        if self.scale_tril is not None:
+            sigma_q = self.scale_tril @ self.scale_tril.T
+        else:
+            sigma_q = self.covariance_matrix
+        
+        # Get Σ_p (p's covariance)
+        if scale_tril_p is not None:
+            sigma_p = scale_tril_p @ scale_tril_p.T
+        elif covariance_matrix_p is not None:
+            sigma_p = covariance_matrix_p
+        else:
+            raise ValueError("Must provide either covariance_matrix_p or scale_tril_p")
+        
+        # Compute Σ_p⁻¹
+        sigma_p_inv = torch.linalg.inv(sigma_p)
+        
+        # Compute log|Σ_p|
+        sign, logdet_sigma_p = torch.linalg.slogdet(sigma_p)
+        
+        # Compute tr(Σ_p⁻¹ Σ_q)
+        trace_term = torch.trace(sigma_p_inv @ sigma_q)
+        
+        # Compute (μ_q - μ_p)ᵀ Σ_p⁻¹ (μ_q - μ_p)
+        diff = mu_q - loc_p
+        mahalanobis_term = diff @ sigma_p_inv @ diff
+        
+        # E_q[log p(X)]
+        result = (-0.5 * d * torch.log(torch.tensor(2 * torch.pi, dtype=mu_q.dtype, device=mu_q.device))
+                 - 0.5 * logdet_sigma_p
+                 - 0.5 * (trace_term + mahalanobis_term))
+        
+        return result
 
 
 class ProductDistribution:
@@ -322,3 +434,52 @@ class ProductDistribution:
                 raise NotImplementedError(f"Distribution {type(d)} does not implement expected_log")
         
         return sum(expected_logs)  # type: ignore[return-value]
+
+    def expected_log_prob(self, distributions_p: List[Union['GammaDistribution', 'MultivariateGaussianDistribution', 'ProductDistribution']], **kwargs) -> torch.Tensor:
+        """
+        Compute E_q[log p(X)] where q is self (product of distributions) and p is another product.
+        
+        For independent distributions:
+        E_q[log p(X₁, X₂, ...)] = E_q[log p(X₁)] + E_q[log p(X₂)] + ...
+        
+        Args:
+            distributions_p: List of distributions for p, matching structure of self
+            **kwargs: Additional parameters to pass to individual expected_log_prob methods
+            
+        Returns:
+            Sum of expected log probabilities from all component distributions
+        """
+        if len(distributions_p) != len(self.distributions):
+            raise ValueError(
+                f"Number of distributions must match: "
+                f"q has {len(self.distributions)}, p has {len(distributions_p)}"
+            )
+        
+        expected_log_probs = []
+        for q_dist, p_dist in zip(self.distributions, distributions_p):
+            if hasattr(q_dist, 'expected_log_prob'):
+                # Extract parameters from p_dist to pass to q_dist.expected_log_prob
+                if isinstance(p_dist, GammaDistribution):
+                    elp = q_dist.expected_log_prob(
+                        concentration_p=p_dist.concentration,
+                        rate_p=p_dist.rate
+                    )
+                elif isinstance(p_dist, MultivariateGaussianDistribution):
+                    elp = q_dist.expected_log_prob(
+                        loc_p=p_dist.loc,
+                        covariance_matrix_p=p_dist.covariance_matrix,
+                        scale_tril_p=p_dist.scale_tril
+                    )
+                elif isinstance(p_dist, ProductDistribution):
+                    # Recursive call for nested products
+                    elp = q_dist.expected_log_prob(distributions_p=p_dist.distributions)
+                else:
+                    raise NotImplementedError(f"expected_log_prob not implemented for {type(p_dist)}")
+                
+                expected_log_probs.append(elp)
+            else:
+                raise NotImplementedError(
+                    f"Distribution {type(q_dist)} does not implement expected_log_prob"
+                )
+        
+        return sum(expected_log_probs)  # type: ignore[return-value]

@@ -74,6 +74,9 @@ def create_bayesian_tensor_train(
     bmpo.sigma_input_nodes = sigma_input_nodes  # type: ignore
     bmpo.sigma_mpo.input_nodes = sigma_input_nodes
     
+    # Re-discover nodes to include input nodes in the network
+    bmpo.sigma_mpo.nodes, bmpo.sigma_mpo.node_indices = bmpo.sigma_mpo._discover_nodes()
+    
     return bmpo
 
 

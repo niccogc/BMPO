@@ -84,6 +84,9 @@ class BayesianMPO:
             concentration=self.tau_alpha,
             rate=self.tau_beta
         )
+        
+        # Initialize prior hyperparameters (uninformative by default)
+        self._initialize_prior_hyperparameters()
     
     def _create_sigma_nodes(self) -> List[TensorNode]:
         """
@@ -188,6 +191,73 @@ class BayesianMPO:
             # Set the Σ-node tensor
             sigma_node.tensor = sigma_permuted
     
+    def _initialize_prior_hyperparameters(self) -> None:
+        """
+        Initialize prior hyperparameters p(θ).
+        
+        The prior should be set BEFORE variational parameters, as priors inform initialization.
+        Default prior hyperparameters (uninformative/weakly informative):
+        - p(τ) ~ Gamma(α₀=1, β₀=1)  - uninformative
+        - p(Wᵢ) ~ N(0, σ₀²I) where σ₀²=10 - weakly informative, large variance
+        - p(ω), p(φ) ~ Gamma(1, 1) - uninformative
+        
+        These should be set via set_prior_hyperparameters() before running inference.
+        """
+        # Prior for τ: uninformative Gamma(1, 1)
+        self.prior_tau_alpha = torch.tensor(1.0, dtype=self.tau_alpha.dtype, device=self.tau_alpha.device)
+        self.prior_tau_beta = torch.tensor(1.0, dtype=self.tau_beta.dtype, device=self.tau_beta.device)
+        
+        # Prior for mode parameters: uninformative Gamma(1, 1) for all dimensions
+        # Store as dict: {label: {'c0' or 'f0': tensor, 'e0' or 'g0': tensor}}
+        self.prior_mode_params = {}
+        for label, dist_info in self.mu_mpo.distributions.items():
+            size = len(dist_info['expectation'])
+            if dist_info['type'] == 'rank':
+                self.prior_mode_params[label] = {
+                    'c0': torch.ones(size, dtype=dist_info['c'].dtype, device=dist_info['c'].device),
+                    'e0': torch.ones(size, dtype=dist_info['e'].dtype, device=dist_info['e'].device)
+                }
+            else:  # vertical
+                self.prior_mode_params[label] = {
+                    'f0': torch.ones(size, dtype=dist_info['f'].dtype, device=dist_info['f'].device),
+                    'g0': torch.ones(size, dtype=dist_info['g'].dtype, device=dist_info['g'].device)
+                }
+        
+        # Prior for blocks: N(0, σ₀²I) with σ₀²=10 (weakly informative)
+        # TODO: Since the dimension of the Sigma block diverge very rapidly, and the sigma prior is just diagonal, it is not needed to expand it and store. we can simply store the diagonal values and If isomorphic, only the value of the variace without expliciting the identity. Prograpagte the usage of this logic for where it gets used. Also variance should be made as a choosable parameters.
+        self.prior_block_sigma0 = []
+        for mu_node in self.mu_nodes:
+            d = mu_node.tensor.numel()
+            # Prior covariance: 10 * I (large variance, weakly informative)
+            sigma0 = 10.0 * torch.eye(d, dtype=mu_node.tensor.dtype, device=mu_node.tensor.device)
+            self.prior_block_sigma0.append(sigma0)
+    
+    def set_prior_hyperparameters(
+        self,
+        tau_alpha0: Optional[torch.Tensor] = None,
+        tau_beta0: Optional[torch.Tensor] = None,
+        mode_params0: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+        block_sigma0: Optional[List[torch.Tensor]] = None
+    ) -> None:
+        """
+        Set prior hyperparameters for p(θ).
+        
+        Args:
+            tau_alpha0: Prior α₀ for p(τ) ~ Gamma(α₀, β₀)
+            tau_beta0: Prior β₀ for p(τ) ~ Gamma(α₀, β₀)
+            mode_params0: Dict of prior parameters for modes, e.g.:
+                         {'r1': {'c0': tensor, 'e0': tensor}, 'f': {'f0': tensor, 'g0': tensor}}
+            block_sigma0: List of prior covariances Σ₀ for p(Wᵢ) ~ N(0, Σ₀)
+        """
+        if tau_alpha0 is not None:
+            self.prior_tau_alpha = tau_alpha0
+        if tau_beta0 is not None:
+            self.prior_tau_beta = tau_beta0
+        if mode_params0 is not None:
+            self.prior_mode_params.update(mode_params0)
+        if block_sigma0 is not None:
+            self.prior_block_sigma0 = block_sigma0
+    
     def get_mu_distributions(self, label: str) -> Optional[List[GammaDistribution]]:
         """Get Gamma distributions for a μ-MPO dimension."""
         return self.mu_mpo.get_gamma_distributions(label)
@@ -226,7 +296,60 @@ class BayesianMPO:
             concentration=self.tau_alpha,
             rate=self.tau_beta
         )
-    
+
+    def update_tau_variational(
+        self,
+        X: torch.Tensor,
+        y: torch.Tensor
+    ) -> None:
+        """
+        Variational update for τ parameters (coordinate ascent).
+        
+        Updates q(τ) ~ Gamma(α_q, β_q) based on data (X, y).
+        
+        Update formulas:
+        - α_q = α_p + S/2
+        - β_q = β_p + Σ_s[y_s · μ(x_s)] + 1/2 * Σ_s[Σ(x_s)]
+        
+        where:
+        - S is the number of samples
+        - α_p, β_p are prior hyperparameters
+        - μ(x_s) is μ-MPO forward pass for sample s (scalar output)
+        - Σ(x_s) is Σ-MPO forward pass for sample s (scalar output)
+        
+        Args:
+            X: Input data, shape (S, feature_dims) where S is number of samples
+            y: Target data, shape (S,) or (S, 1) for scalar outputs
+        """
+        S = X.shape[0]  # Number of samples
+        
+        # Update α_q = α_p + S/2
+        alpha_q = self.prior_tau_alpha + S / 2.0
+        
+        # Compute β_q = β_p + Σ_s[y_s · μ(x_s)] + 1/2 * Σ_s[Σ(x_s)]
+        
+        # Term 1: β_p (prior)
+        beta_q = self.prior_tau_beta.clone()
+        
+        # Term 2: Σ_s[y_s · μ(x_s)]
+        # Forward pass through μ-MPO for all samples at once
+        mu_output = self.forward_mu(X, to_tensor=True)  # Shape: (S, 1, 1, ...) 
+        mu_flat = mu_output.reshape(S, -1)  # (S, output_dim)
+        y_flat = y.reshape(S, -1)  # (S, output_dim)
+        
+        # Dot product: sum over all samples and output dimensions
+        beta_q = beta_q + torch.sum(y_flat * mu_flat)
+        
+        # Term 3: 1/2 * Σ_s[Σ(x_s)]
+        # Forward pass through Σ-MPO for all samples at once
+        sigma_output = self.forward_sigma(X, to_tensor=True)  # Shape: (S, 1, 1, ...)
+        
+        # Sum over all samples and output dimensions (for scalar output, just sum all)
+        beta_q = beta_q + 0.5 * torch.sum(sigma_output)
+        
+        # Update the parameters
+        self.update_tau(alpha=alpha_q, beta=beta_q)
+
     def get_tau_mean(self) -> torch.Tensor:
         """Get mean of τ distribution: E[τ] = α/β."""
         return self.tau_distribution.mean()
@@ -248,19 +371,22 @@ class BayesianMPO:
         """
         return self.mu_mpo.forward(x, to_tensor=to_tensor)
     
-    def forward_sigma(self, to_tensor: bool = False) -> Union[TensorNode, torch.Tensor]:
+    def forward_sigma(self, x: Optional[torch.Tensor] = None, to_tensor: bool = False) -> Union[TensorNode, torch.Tensor]:
         """
         Forward pass through Σ-MPO.
         
-        Σ-MPO represents the correlation/variation structure.
+        Σ-MPO represents the correlation/variation structure E[f(X) ⊗ f(X)^T].
+        If x is provided, contracts Σ-MPO with input x (sets both 'o' and 'i' inputs to x).
+        If x is None, uses current input node values.
         
         Args:
+            x: Input data (optional). If provided, both outer and inner inputs are set to x.
             to_tensor: If True, return tensor instead of TensorNode
             
         Returns:
             Output from Σ-MPO (correlation structure)
         """
-        return self.sigma_mpo.forward(None, to_tensor=to_tensor)
+        return self.sigma_mpo.forward(x, to_tensor=to_tensor)
     
     def get_mu_jacobian(self, node: TensorNode):
         """
@@ -353,10 +479,14 @@ class BayesianMPO:
         if device is not None or dtype is not None:
             self.tau_alpha = self.tau_alpha.to(device=device, dtype=dtype)
             self.tau_beta = self.tau_beta.to(device=device, dtype=dtype)
-            self.tau_distribution = GammaDistribution(
-                concentration=self.tau_alpha,
-                rate=self.tau_beta
-            )
+        self.tau_distribution = GammaDistribution(
+            concentration=self.tau_alpha,
+            rate=self.tau_beta
+        )
+        
+        # Initialize prior hyperparameters (same structure as q, but separate values)
+        # These act as the prior p(θ) with the same factorization as q(θ)
+        self._initialize_prior_hyperparameters()
         return self
     
     def get_block_q_distribution(self, block_idx: int) -> MultivariateGaussianDistribution:
@@ -393,6 +523,8 @@ class BayesianMPO:
         
         # Permute to group outer and inner: [d1_o, d2_o, ..., d1_i, d2_i, ...]
         n_dims = len(shape_half)
+
+        # TODO: FIND OUTER AND INNER through label, not order.
         outer_indices = list(range(0, 2*n_dims, 2))  # [0, 2, 4, ...]
         inner_indices = list(range(1, 2*n_dims, 2))  # [1, 3, 5, ...]
         perm = outer_indices + inner_indices
@@ -407,6 +539,7 @@ class BayesianMPO:
         covariance = sigma_matrix - mu_outer
         
         # Make symmetric to handle numerical errors (floating point precision)
+        # TODO: isnt this a waste since it should be symmetric?
         covariance = 0.5 * (covariance + covariance.T)
         
         return MultivariateGaussianDistribution(
@@ -535,6 +668,113 @@ class BayesianMPO:
                 log_prob = log_prob + gamma.forward().log_prob(val)
         
         return log_prob
+    
+    def compute_expected_log_prior(self) -> torch.Tensor:
+        """
+        Compute E_q[log p(θ)] where p(θ) is the prior.
+        
+        The prior factorizes as:
+        p(θ) = p(τ) × ∏ᵢ p(Wᵢ) × ∏_modes ∏_indices p(mode_param)
+        
+        Therefore:
+        E_q[log p(θ)] = E_q[log p(τ)] + Σᵢ E_q[log p(Wᵢ)] + Σ_modes Σ_indices E_q[log p(mode_param)]
+        
+        Returns:
+            E_q[log p(θ)] as a scalar tensor
+        """
+        log_p_total = torch.tensor(0.0, dtype=self.tau_alpha.dtype, device=self.tau_alpha.device)
+        
+        # 1. E_q[log p(τ)]
+        log_p_tau = self._expected_log_prior_tau()
+        log_p_total = log_p_total + log_p_tau
+        
+        # 2. E_q[log p(Wᵢ)] for each block
+        for i in range(len(self.mu_nodes)):
+            log_p_block = self._expected_log_prior_block(i)
+            log_p_total = log_p_total + log_p_block
+        
+        # 3. E_q[log p(mode_params)] for all modes
+        log_p_modes = self._expected_log_prior_modes()
+        log_p_total = log_p_total + log_p_modes
+        
+        return log_p_total
+    
+    def _expected_log_prior_tau(self) -> torch.Tensor:
+        """
+        Compute E_q[log p(τ)] where p(τ) ~ Gamma(α₀, β₀).
+        
+        Uses the modular expected_log_prob method from GammaDistribution.
+        
+        Returns:
+            E_q[log p(τ)]
+        """
+        # Simply call the distribution's method with prior parameters
+        return self.tau_distribution.expected_log_prob(
+            concentration_p=self.prior_tau_alpha,
+            rate_p=self.prior_tau_beta
+        )
+    
+    def _expected_log_prior_block(self, block_idx: int) -> torch.Tensor:
+        """
+        Compute E_q[log p(Wᵢ)] where p(Wᵢ) ~ N(0, Σ₀).
+        
+        Uses the modular expected_log_prob method from MultivariateGaussianDistribution.
+        
+        Args:
+            block_idx: Index of the block
+            
+        Returns:
+            E_q[log p(Wᵢ)]
+        """
+        # Get the q-distribution for this block
+        q_block = self.get_block_q_distribution(block_idx)
+        
+        # Prior mean is 0
+        mu_p = torch.zeros_like(q_block.loc)
+        
+        # Prior covariance Σ₀
+        sigma_p = self.prior_block_sigma0[block_idx]
+        
+        # Use the modular method
+        return q_block.expected_log_prob(
+            loc_p=mu_p,
+            covariance_matrix_p=sigma_p
+        )
+    
+    def _expected_log_prior_modes(self) -> torch.Tensor:
+        """
+        Compute E_q[log p(mode_params)] for all modes.
+        
+        Uses the modular expected_log_prob method from GammaDistribution.
+        
+        Returns:
+            Sum of E_q[log p(mode_param)] over all modes and indices
+        """
+        log_p_modes_total = torch.tensor(0.0, dtype=self.tau_alpha.dtype, device=self.tau_alpha.device)
+        
+        for label, prior_params in self.prior_mode_params.items():
+            # Get current variational distributions
+            gammas_q = self.mu_mpo.get_gamma_distributions(label)
+            if gammas_q is None:
+                continue
+            
+            # Get prior parameters
+            if 'c0' in prior_params:  # rank dimension
+                alpha0 = prior_params['c0']
+                beta0 = prior_params['e0']
+            else:  # vertical dimension
+                alpha0 = prior_params['f0']
+                beta0 = prior_params['g0']
+            
+            # Compute E_q[log p(θ)] for each index in this dimension using modular method
+            for i, gamma_q in enumerate(gammas_q):
+                log_p_theta = gamma_q.expected_log_prob(
+                    concentration_p=alpha0[i],
+                    rate_p=beta0[i]
+                )
+                log_p_modes_total = log_p_modes_total + log_p_theta
+        
+        return log_p_modes_total
     
     def summary(self) -> None:
         """Print summary of the Bayesian MPO structure."""
