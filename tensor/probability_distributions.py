@@ -1,6 +1,6 @@
 import torch
 import torch.distributions as dist
-from typing import List, Union
+from typing import List, Union, Optional
 
 
 class GammaDistribution:
@@ -69,6 +69,31 @@ class GammaDistribution:
             Entropy value (scalar or tensor)
         """
         return self.forward().entropy()
+    
+    def expected_log(self, concentration: Optional[torch.Tensor] = None, 
+                     rate: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute E[log X] for the Gamma distribution.
+        
+        For X ~ Gamma(α, β):
+        E[log X] = ψ(α) - log(β)
+        
+        where ψ is the digamma function (derivative of log gamma function).
+        
+        Args:
+            concentration: Alternative concentration parameter (α) to compute expectation with.
+                          If None, uses self.concentration.
+            rate: Alternative rate parameter (β) to compute expectation with.
+                  If None, uses self.rate.
+        
+        Returns:
+            Expected value of log X
+        """
+        alpha = concentration if concentration is not None else self.concentration
+        beta = rate if rate is not None else self.rate
+        
+        # E[log X] = ψ(α) - log(β)
+        return torch.digamma(alpha) - torch.log(beta)
 
 
 class MultivariateGaussianDistribution:
@@ -144,6 +169,43 @@ class MultivariateGaussianDistribution:
             Entropy value (scalar or tensor)
         """
         return self.forward().entropy()
+    
+    def expected_log(self, loc: Optional[torch.Tensor] = None,
+                     covariance_matrix: Optional[torch.Tensor] = None,
+                     scale_tril: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute E[log p(X)] for the Multivariate Gaussian distribution.
+        
+        Note: For a multivariate Gaussian, E[log X] doesn't have a simple closed form
+        for the random variable X itself. This method computes the expected log-density
+        E[log p(X)] which is related to the negative entropy.
+        
+        For X ~ N(μ, Σ):
+        E[log p(X)] = -0.5 * [d * log(2π) + log|Σ| + d]
+        
+        where d is the dimensionality.
+        
+        Args:
+            loc: Alternative mean vector. If None, uses self.loc.
+            covariance_matrix: Alternative covariance matrix. If None, uses self.covariance_matrix.
+            scale_tril: Alternative Cholesky factor. If None, uses self.scale_tril.
+        
+        Returns:
+            Expected log-density value
+        """
+        # Use provided parameters or fall back to instance parameters
+        use_loc = loc if loc is not None else self.loc
+        use_cov = covariance_matrix if covariance_matrix is not None else self.covariance_matrix
+        use_scale = scale_tril if scale_tril is not None else self.scale_tril
+        
+        # Create temporary distribution with specified parameters
+        if use_scale is not None:
+            temp_dist = dist.MultivariateNormal(use_loc, scale_tril=use_scale)
+        else:
+            temp_dist = dist.MultivariateNormal(use_loc, covariance_matrix=use_cov)
+        
+        # E[log p(X)] = -entropy
+        return -temp_dist.entropy()
 
 
 class ProductDistribution:
@@ -206,7 +268,15 @@ class ProductDistribution:
         Returns:
             List of samples from each distribution
         """
-        return [d.forward().sample(sample_shape) for d in self.distributions]
+        samples = []
+        for d in self.distributions:
+            d_forward = d.forward()
+            if isinstance(d_forward, list):
+                # Handle nested ProductDistribution
+                samples.extend([dist_obj.sample(sample_shape) for dist_obj in d_forward])  # type: ignore[attr-defined]
+            else:
+                samples.append(d_forward.sample(sample_shape))  # type: ignore
+        return samples
     
     def log_prob(self, values: List):
         """
@@ -221,5 +291,34 @@ class ProductDistribution:
         if len(values) != len(self.distributions):
             raise ValueError("Number of values must match number of distributions")
         
-        log_probs = [d.forward().log_prob(v) for d, v in zip(self.distributions, values)]
+        log_probs = []
+        for d, v in zip(self.distributions, values):
+            d_forward = d.forward()
+            if isinstance(d_forward, list):
+                # Handle nested ProductDistribution - not fully supported
+                raise NotImplementedError("log_prob not implemented for nested ProductDistribution")
+            else:
+                log_probs.append(d_forward.log_prob(v))  # type: ignore
         return sum(log_probs)
+    
+    def expected_log(self, **kwargs) -> torch.Tensor:
+        """
+        Compute E[log X] for the product distribution.
+        
+        For independent distributions, E[log(X1 * X2 * ... * Xn)] = E[log X1] + E[log X2] + ... + E[log Xn]
+        
+        Args:
+            **kwargs: Optional parameters to pass to each distribution's expected_log method.
+                     Can include distribution-specific parameters.
+        
+        Returns:
+            Sum of expected log values from all distributions
+        """
+        expected_logs = []
+        for d in self.distributions:
+            if hasattr(d, 'expected_log'):
+                expected_logs.append(d.expected_log(**kwargs))
+            else:
+                raise NotImplementedError(f"Distribution {type(d)} does not implement expected_log")
+        
+        return sum(expected_logs)  # type: ignore[return-value]

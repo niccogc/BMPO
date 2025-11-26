@@ -13,7 +13,7 @@ import torch
 from tensor.node import TensorNode
 from tensor.network import TensorNetwork
 from tensor.probability_distributions import GammaDistribution, ProductDistribution
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple, Union, Any, Sequence, Set, Tuple, Union, Any, Set, Tuple, Union
 
 
 class BMPONetwork(TensorNetwork):
@@ -36,9 +36,16 @@ class BMPONetwork(TensorNetwork):
         }
     """
     
-    def __init__(self, input_nodes, main_nodes, train_nodes=None, 
-                 output_labels=('s',), sample_dim='s', 
-                 rank_labels=None, distributions=None):
+    def __init__(
+        self, 
+        input_nodes: List[TensorNode], 
+        main_nodes: List[TensorNode], 
+        train_nodes: Optional[List[TensorNode]] = None, 
+        output_labels: Tuple[str, ...] = ('s',), 
+        sample_dim: str = 's', 
+        rank_labels: Optional[Union[Set[str], List[str]]] = None, 
+        distributions: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> None:
         """
         Initialize BMPO Network.
         
@@ -68,15 +75,15 @@ class BMPONetwork(TensorNetwork):
         else:
             self.distributions = distributions
     
-    def _infer_rank_labels(self):
+    def _infer_rank_labels(self) -> Set[str]:
         """Infer which dimensions are ranks from node left_labels and right_labels."""
-        rank_labels = set()
+        rank_labels: Set[str] = set()
         for node in self.main_nodes:
             rank_labels.update(node.left_labels)
             rank_labels.update(node.right_labels)
         return rank_labels
     
-    def _initialize_distributions(self):
+    def _initialize_distributions(self) -> None:
         """Initialize Gamma distributions for all unique dimension labels."""
         for node in self.main_nodes:
             for label, size in zip(node.dim_labels, node.shape):
@@ -102,16 +109,21 @@ class BMPONetwork(TensorNetwork):
                             'expectation': torch.ones(size, dtype=dtype) * 2.0  # E[φ] = f/g
                         }
     
-    def get_distribution_params(self, label):
+    def get_distribution_params(self, label: str) -> Optional[Dict[str, Any]]:
         """Get distribution parameters for a dimension label."""
         return self.distributions.get(label)
     
-    def get_expectations(self, label):
+    def get_expectations(self, label: str) -> Optional[torch.Tensor]:
         """Get expectation values E[ω] or E[φ] for a dimension."""
         dist = self.distributions.get(label)
         return dist['expectation'] if dist else None
     
-    def update_distribution_params(self, label, param1=None, param2=None):
+    def update_distribution_params(
+        self, 
+        label: str, 
+        param1: Optional[torch.Tensor] = None, 
+        param2: Optional[torch.Tensor] = None
+    ) -> None:
         """
         Update Gamma distribution parameters for a dimension.
         
@@ -140,13 +152,14 @@ class BMPONetwork(TensorNetwork):
             # Update expectation using mean() from GammaDistribution objects
             self._update_expectations(label)
     
-    def _update_expectations(self, label):
+    def _update_expectations(self, label: str) -> None:
         """Update expectation values from Gamma distribution means."""
         gammas = self.get_gamma_distributions(label)
-        expectations = torch.tensor([gamma.mean() for gamma in gammas])
-        self.distributions[label]['expectation'] = expectations
+        if gammas is not None:
+            expectations = torch.tensor([gamma.mean() for gamma in gammas])
+            self.distributions[label]['expectation'] = expectations
     
-    def get_gamma_distributions(self, label):
+    def get_gamma_distributions(self, label: str) -> Optional[List[GammaDistribution]]:
         """
         Get list of Gamma distribution objects for a dimension.
         
@@ -180,7 +193,7 @@ class BMPONetwork(TensorNetwork):
         
         return distributions
     
-    def get_product_distribution(self, label):
+    def get_product_distribution(self, label: str) -> Optional[ProductDistribution]:
         """
         Get product distribution for all indices in a dimension.
         
@@ -190,9 +203,9 @@ class BMPONetwork(TensorNetwork):
         gammas = self.get_gamma_distributions(label)
         if gammas is None:
             return None
-        return ProductDistribution(gammas)
+        return ProductDistribution(gammas)  # type: ignore
     
-    def compute_entropy(self, label):
+    def compute_entropy(self, label: str) -> Union[torch.Tensor, None]:
         """
         Compute total entropy for a dimension (sum of entropies).
         
@@ -205,9 +218,9 @@ class BMPONetwork(TensorNetwork):
         product_dist = self.get_product_distribution(label)
         if product_dist is None:
             return None
-        return product_dist.entropy()
+        return product_dist.entropy()  # type: ignore
     
-    def get_jacobian(self, node):
+    def get_jacobian(self, node: TensorNode):
         """
         Compute Jacobian (J) for a node - the network contracted without that block.
         
@@ -219,7 +232,7 @@ class BMPONetwork(TensorNetwork):
         """
         return self.compute_jacobian_stack(node)
     
-    def trim(self, thresholds):
+    def trim(self, thresholds: Dict[str, float]) -> 'BMPONetwork':
         """
         Trim all nodes in the network based on expectation value thresholds.
         
@@ -266,7 +279,7 @@ class BMPONetwork(TensorNetwork):
         
         return self
     
-    def _trim_node(self, node, keep_indices):
+    def _trim_node(self, node: TensorNode, keep_indices: Dict[str, torch.Tensor]) -> None:
         """Trim a node's tensor based on keep_indices for each dimension."""
         new_tensor = node.tensor
         
@@ -277,7 +290,7 @@ class BMPONetwork(TensorNetwork):
         
         node.tensor = new_tensor
     
-    def to(self, device=None, dtype=None):
+    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> 'BMPONetwork':
         """Move network tensors and distribution parameters to device/dtype."""
         super().to(device=device, dtype=dtype)
         for label, dist in self.distributions.items():

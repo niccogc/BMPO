@@ -12,8 +12,12 @@ import torch
 from tensor.node import TensorNode
 from tensor.network import TensorNetwork
 from tensor.bmpo import BMPONetwork
-from tensor.probability_distributions import GammaDistribution
-from typing import Dict, List, Optional, Tuple
+from tensor.probability_distributions import (
+    GammaDistribution, 
+    MultivariateGaussianDistribution,
+    ProductDistribution
+)
+from typing import Dict, List, Optional, Tuple, Union, Set, Any
 
 
 class BayesianMPO:
@@ -32,8 +36,14 @@ class BayesianMPO:
         Σ-block shape: (3, 3, 4, 4, 5, 5) with labels ['r1o', 'r1i', 'f1o', 'f1i', 'r2o', 'r2i']
     """
     
-    def __init__(self, mu_nodes, input_nodes=None, rank_labels=None, 
-                 tau_alpha=None, tau_beta=None):
+    def __init__(
+        self, 
+        mu_nodes: List[TensorNode], 
+        input_nodes: Optional[List[TensorNode]] = None, 
+        rank_labels: Optional[Union[List[str], set]] = None, 
+        tau_alpha: Optional[torch.Tensor] = None, 
+        tau_beta: Optional[torch.Tensor] = None
+    ) -> None:
         """
         Initialize Bayesian MPO.
         
@@ -75,7 +85,7 @@ class BayesianMPO:
             rate=self.tau_beta
         )
     
-    def _create_sigma_nodes(self):
+    def _create_sigma_nodes(self) -> List[TensorNode]:
         """
         Create Σ-MPO nodes from μ-MPO nodes.
         
@@ -126,21 +136,80 @@ class BayesianMPO:
                 if label in next_node.dim_labels:
                     curr_node.connect(next_node, label)
         
+        # Initialize Σ-nodes to ensure positive definite covariance
+        self._initialize_sigma_nodes(sigma_nodes)
+        
         return sigma_nodes
     
-    def get_mu_distributions(self, label):
+    def _initialize_sigma_nodes(self, sigma_nodes: List[TensorNode]) -> None:
+        """
+        Initialize Σ-MPO nodes to ensure covariance is positive definite.
+        
+        For each block, we want Cov = Σ - μ ⊗ μ^T to be positive definite.
+        A simple initialization is: Σ = μ ⊗ μ^T + σ²I
+        where σ² is a small variance parameter.
+        
+        This corresponds to setting the Σ-node such that when reshaped:
+        E[W ⊗ W^T] = μ ⊗ μ^T + σ²I
+        
+        Args:
+            sigma_nodes: List of Σ-MPO nodes to initialize
+        """
+        for mu_node, sigma_node in zip(self.mu_nodes, sigma_nodes):
+            # Get μ block (flattened)
+            mu_flat = mu_node.tensor.flatten()
+            d = mu_flat.numel()
+            
+            # Compute μ ⊗ μ^T + σ²I
+            # Using σ² = 1.0 as default initial variance
+            initial_variance = 1.0
+            mu_outer = torch.outer(mu_flat, mu_flat)
+            sigma_matrix = mu_outer + initial_variance * torch.eye(d, dtype=mu_flat.dtype, device=mu_flat.device)
+            
+            # Reshape sigma_matrix (d, d) back to Σ-node shape
+            # Σ-node has shape (d1, d1, d2, d2, ...) where d = d1 * d2 * ...
+            shape_half = mu_node.shape
+            n_dims = len(shape_half)
+            
+            # First reshape to separate dimensions
+            # (d, d) -> (d1, d2, ..., d1, d2, ...)
+            expanded_shape = list(shape_half) + list(shape_half)
+            sigma_expanded = sigma_matrix.reshape(*expanded_shape)
+            
+            # Permute to interleave outer and inner: (d1, d2, ..., d1, d2, ...) -> (d1, d1, d2, d2, ...)
+            # Create permutation that interleaves
+            perm = []
+            for i in range(n_dims):
+                perm.append(i)           # outer dimension i
+                perm.append(i + n_dims)  # inner dimension i
+            
+            sigma_permuted = sigma_expanded.permute(*perm)
+            
+            # Set the Σ-node tensor
+            sigma_node.tensor = sigma_permuted
+    
+    def get_mu_distributions(self, label: str) -> Optional[List[GammaDistribution]]:
         """Get Gamma distributions for a μ-MPO dimension."""
         return self.mu_mpo.get_gamma_distributions(label)
     
-    def get_mu_expectations(self, label):
+    def get_mu_expectations(self, label: str) -> Optional[torch.Tensor]:
         """Get expectation values E[ω] or E[φ] for μ-MPO dimension."""
         return self.mu_mpo.get_expectations(label)
     
-    def update_mu_params(self, label, param1=None, param2=None):
+    def update_mu_params(
+        self, 
+        label: str, 
+        param1: Optional[torch.Tensor] = None, 
+        param2: Optional[torch.Tensor] = None
+    ) -> None:
         """Update μ-MPO distribution parameters."""
         self.mu_mpo.update_distribution_params(label, param1, param2)
     
-    def update_tau(self, alpha=None, beta=None):
+    def update_tau(
+        self, 
+        alpha: Optional[torch.Tensor] = None, 
+        beta: Optional[torch.Tensor] = None
+    ) -> None:
         """
         Update τ distribution parameters.
         
@@ -158,15 +227,15 @@ class BayesianMPO:
             rate=self.tau_beta
         )
     
-    def get_tau_mean(self):
+    def get_tau_mean(self) -> torch.Tensor:
         """Get mean of τ distribution: E[τ] = α/β."""
         return self.tau_distribution.mean()
     
-    def get_tau_entropy(self):
+    def get_tau_entropy(self) -> torch.Tensor:
         """Get entropy of τ distribution."""
         return self.tau_distribution.entropy()
     
-    def forward_mu(self, x, to_tensor=False):
+    def forward_mu(self, x: torch.Tensor, to_tensor: bool = False) -> Union[TensorNode, torch.Tensor]:
         """
         Forward pass through μ-MPO.
         
@@ -179,7 +248,7 @@ class BayesianMPO:
         """
         return self.mu_mpo.forward(x, to_tensor=to_tensor)
     
-    def forward_sigma(self, to_tensor=False):
+    def forward_sigma(self, to_tensor: bool = False) -> Union[TensorNode, torch.Tensor]:
         """
         Forward pass through Σ-MPO.
         
@@ -193,7 +262,7 @@ class BayesianMPO:
         """
         return self.sigma_mpo.forward(None, to_tensor=to_tensor)
     
-    def get_mu_jacobian(self, node):
+    def get_mu_jacobian(self, node: TensorNode):
         """
         Get Jacobian for a μ-MPO node.
         
@@ -205,7 +274,7 @@ class BayesianMPO:
         """
         return self.mu_mpo.get_jacobian(node)
     
-    def get_sigma_jacobian(self, node):
+    def get_sigma_jacobian(self, node: TensorNode):
         """
         Get Jacobian for a Σ-MPO node.
         
@@ -217,7 +286,7 @@ class BayesianMPO:
         """
         return self.sigma_mpo.compute_jacobian_stack(node)
     
-    def trim(self, thresholds):
+    def trim(self, thresholds: Dict[str, float]) -> 'BayesianMPO':
         """
         Trim both μ-MPO and Σ-MPO based on μ expectations.
         
@@ -262,7 +331,7 @@ class BayesianMPO:
         
         return self
     
-    def _trim_sigma_node(self, node, keep_indices):
+    def _trim_sigma_node(self, node: TensorNode, keep_indices: Dict[str, torch.Tensor]) -> None:
         """Trim a Σ-MPO node based on keep_indices."""
         new_tensor = node.tensor
         
@@ -273,7 +342,11 @@ class BayesianMPO:
         
         node.tensor = new_tensor
     
-    def to(self, device=None, dtype=None):
+    def to(
+        self, 
+        device: Optional[torch.device] = None, 
+        dtype: Optional[torch.dtype] = None
+    ) -> 'BayesianMPO':
         """Move all structures to device/dtype."""
         self.mu_mpo.to(device=device, dtype=dtype)
         self.sigma_mpo.to(device=device, dtype=dtype)
@@ -286,7 +359,184 @@ class BayesianMPO:
             )
         return self
     
-    def summary(self):
+    def get_block_q_distribution(self, block_idx: int) -> MultivariateGaussianDistribution:
+        """
+        Get the q-distribution for a specific block as a Multivariate Normal.
+        
+        For block i, q(W_i) = N(μ_i, Σ_i - μ_i ⊗ μ_i^T)
+        where:
+        - μ_i = E_q[W_i] is the μ-MPO block (flattened)
+        - Σ_i = E_q[W_i ⊗ W_i^T] is related to the Σ-MPO block (flattened)
+        - Covariance = Σ_i - μ_i ⊗ μ_i^T
+        
+        Args:
+            block_idx: Index of the block (0 to N-1)
+            
+        Returns:
+            MultivariateGaussianDistribution for this block
+        """
+        mu_node = self.mu_nodes[block_idx]
+        sigma_node = self.sigma_nodes[block_idx]
+        
+        # Flatten μ block: E_q[W_i]
+        mu_flat = mu_node.tensor.flatten()
+        d = mu_flat.numel()
+        
+        # Flatten Σ block to get E_q[W_i ⊗ W_i^T]
+        # Σ-node has shape (d1, d1, d2, d2, ...) -> reshape to (d, d)
+        sigma_tensor = sigma_node.tensor
+        
+        # Reshape: group 'o' and 'i' dimensions
+        # For each original dimension of size n, we have (n_o, n_i)
+        # We want to flatten to (d, d) where d = product of all n's
+        shape_half = mu_node.shape
+        
+        # Permute to group outer and inner: [d1_o, d2_o, ..., d1_i, d2_i, ...]
+        n_dims = len(shape_half)
+        outer_indices = list(range(0, 2*n_dims, 2))  # [0, 2, 4, ...]
+        inner_indices = list(range(1, 2*n_dims, 2))  # [1, 3, 5, ...]
+        perm = outer_indices + inner_indices
+        
+        sigma_permuted = sigma_tensor.permute(*perm)
+        
+        # Reshape to (d, d)
+        sigma_matrix = sigma_permuted.reshape(d, d)
+        
+        # Compute covariance: Cov = E[W ⊗ W^T] - E[W] ⊗ E[W]^T
+        mu_outer = torch.outer(mu_flat, mu_flat)
+        covariance = sigma_matrix - mu_outer
+        
+        # Make symmetric to handle numerical errors (floating point precision)
+        covariance = 0.5 * (covariance + covariance.T)
+        
+        return MultivariateGaussianDistribution(
+            loc=mu_flat,
+            covariance_matrix=covariance
+        )
+    
+    def get_all_block_q_distributions(self) -> List[MultivariateGaussianDistribution]:
+        """
+        Get q-distributions for all blocks.
+        
+        Returns:
+            List of MultivariateGaussianDistribution, one for each block
+        """
+        return [self.get_block_q_distribution(i) for i in range(len(self.mu_nodes))]
+    
+    def get_mode_q_distributions(self) -> Dict[str, List[GammaDistribution]]:
+        """
+        Get all Gamma q-distributions for each mode (dimension).
+        
+        For each mode (dimension label), we have a list of Gamma distributions,
+        one for each index in that dimension.
+        
+        Returns:
+            Dict mapping dimension label -> list of GammaDistribution objects
+        """
+        mode_distributions = {}
+        for label in self.mu_mpo.distributions.keys():
+            gammas = self.mu_mpo.get_gamma_distributions(label)
+            if gammas is not None:
+                mode_distributions[label] = gammas
+        return mode_distributions
+    
+    def get_full_q_distribution(self) -> ProductDistribution:
+        """
+        Get the full q-distribution as a product of all components.
+        
+        q(θ) = q(τ) × ∏_i q(W_i) × ∏_modes ∏_indices q(mode_param)
+        
+        where:
+        - q(τ) ~ Gamma(α, β)
+        - q(W_i) ~ N(μ_i, Σ_i - μ_i ⊗ μ_i^T) for each block i
+        - q(mode_param) ~ Gamma(c, e) or Gamma(f, g) for each mode index
+        
+        Returns:
+            ProductDistribution containing all component distributions
+        """
+        all_distributions = []
+        
+        # 1. Add τ distribution
+        all_distributions.append(self.tau_distribution)
+        
+        # 2. Add all block distributions (Multivariate Normals)
+        block_dists = self.get_all_block_q_distributions()
+        all_distributions.extend(block_dists)
+        
+        # 3. Add all mode distributions (Gammas)
+        mode_dists = self.get_mode_q_distributions()
+        for label, gamma_list in mode_dists.items():
+            all_distributions.extend(gamma_list)
+        
+        return ProductDistribution(all_distributions)
+    
+    def sample_from_q(self, n_samples: int = 1) -> Dict[str, Any]:
+        """
+        Sample from the q-distribution.
+        
+        Args:
+            n_samples: Number of samples to generate
+            
+        Returns:
+            Dictionary containing:
+            - 'tau': Samples from τ distribution
+            - 'blocks': List of samples from each block distribution
+            - 'modes': Dict of samples from each mode distribution
+        """
+        samples = {}
+        
+        # Sample τ
+        samples['tau'] = self.tau_distribution.forward().sample((n_samples,))
+        
+        # Sample blocks
+        block_dists = self.get_all_block_q_distributions()
+        samples['blocks'] = [
+            dist.forward().sample((n_samples,)) for dist in block_dists
+        ]
+        
+        # Sample modes
+        mode_dists = self.get_mode_q_distributions()
+        samples['modes'] = {}
+        for label, gamma_list in mode_dists.items():
+            samples['modes'][label] = [
+                gamma.forward().sample((n_samples,)) for gamma in gamma_list
+            ]
+        
+        return samples
+    
+    def log_q(self, theta: Dict[str, Any]) -> torch.Tensor:
+        """
+        Compute log q(θ) for given parameter values.
+        
+        Args:
+            theta: Dictionary containing:
+                - 'tau': τ values
+                - 'blocks': List of block parameter values (flattened)
+                - 'modes': Dict of mode parameter values
+                
+        Returns:
+            log q(θ) = log q(τ) + Σ log q(W_i) + Σ log q(mode_params)
+        """
+        log_prob = torch.tensor(0.0, dtype=self.tau_alpha.dtype)
+        
+        # Add log q(τ)
+        log_prob = log_prob + self.tau_distribution.forward().log_prob(theta['tau'])
+        
+        # Add log q(W_i) for each block
+        block_dists = self.get_all_block_q_distributions()
+        for i, (dist, block_val) in enumerate(zip(block_dists, theta['blocks'])):
+            log_prob = log_prob + dist.forward().log_prob(block_val)
+        
+        # Add log q(mode_params)
+        mode_dists = self.get_mode_q_distributions()
+        for label, gamma_list in mode_dists.items():
+            mode_values = theta['modes'][label]
+            for gamma, val in zip(gamma_list, mode_values):
+                log_prob = log_prob + gamma.forward().log_prob(val)
+        
+        return log_prob
+    
+    def summary(self) -> None:
         """Print summary of the Bayesian MPO structure."""
         print("=" * 70)
         print("Bayesian MPO Summary")
