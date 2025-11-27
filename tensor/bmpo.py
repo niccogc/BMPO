@@ -74,6 +74,9 @@ class BMPONetwork(TensorNetwork):
             self._initialize_distributions()
         else:
             self.distributions = distributions
+        
+        # Build mapping from bonds to associated nodes
+        self.bond_to_nodes = self._build_bond_to_nodes_mapping()
     
     def _infer_rank_labels(self) -> Set[str]:
         """Infer which dimensions are ranks from node left_labels and right_labels."""
@@ -84,30 +87,51 @@ class BMPONetwork(TensorNetwork):
         return rank_labels
     
     def _initialize_distributions(self) -> None:
-        """Initialize Gamma distributions for all unique dimension labels."""
+        """
+        Initialize Gamma distributions for all unique dimension labels.
+        
+        Each dimension (bond) gets N Gamma(concentration, rate) distributions,
+        where N is the dimension size. Uses unified parameterization regardless
+        of whether the bond is horizontal (rank) or vertical.
+        
+        Note: Dimensions of size 1 are dummy indices for consistency and don't
+        get Gamma distributions (not learnable).
+        """
         for node in self.main_nodes:
             for label, size in zip(node.dim_labels, node.shape):
-                if label not in self.distributions:
+                if label not in self.distributions and size > 1:
                     dtype = node.tensor.dtype
                     
-                    if label in self.rank_labels:
-                        # Rank dimension: Gamma(c, e) with variable ω
-                        self.distributions[label] = {
-                            'type': 'rank',
-                            'variable': 'omega',
-                            'c': torch.ones(size, dtype=dtype) * 2.0,  # Default c
-                            'e': torch.ones(size, dtype=dtype) * 1.0,  # Default e
-                            'expectation': torch.ones(size, dtype=dtype) * 2.0  # E[ω] = c/e
-                        }
-                    else:
-                        # Vertical dimension: Gamma(f, g) with variable φ
-                        self.distributions[label] = {
-                            'type': 'vertical',
-                            'variable': 'phi',
-                            'f': torch.ones(size, dtype=dtype) * 2.0,  # Default f
-                            'g': torch.ones(size, dtype=dtype) * 1.0,  # Default g
-                            'expectation': torch.ones(size, dtype=dtype) * 2.0  # E[φ] = f/g
-                        }
+                    # Unified structure for all bonds (only if size > 1)
+                    self.distributions[label] = {
+                        'concentration': torch.ones(size, dtype=dtype) * 2.0,  # Default α = 2
+                        'rate': torch.ones(size, dtype=dtype) * 1.0,           # Default β = 1
+                        'expectation': torch.ones(size, dtype=dtype) * 2.0     # E[X] = α/β = 2
+                    }
+
+    def _build_bond_to_nodes_mapping(self) -> Dict[str, List[int]]:
+        """
+        Build mapping from bond labels to node indices.
+        
+        For each bond (dimension label), store which nodes contain that bond.
+        - Horizontal bonds (rank labels): appear in left/right of consecutive nodes
+        - Vertical bonds: appear in a single node
+        
+        Returns:
+            Dict mapping bond_label -> list of node indices that share this bond
+        """
+        bond_to_nodes: Dict[str, List[int]] = {}
+        
+        for node_idx, node in enumerate(self.main_nodes):
+            for label in node.dim_labels:
+                if label not in bond_to_nodes:
+                    bond_to_nodes[label] = []
+                
+                # Add this node index if not already present
+                if node_idx not in bond_to_nodes[label]:
+                    bond_to_nodes[label].append(node_idx)
+        
+        return bond_to_nodes
     
     def get_distribution_params(self, label: str) -> Optional[Dict[str, Any]]:
         """Get distribution parameters for a dimension label."""
@@ -121,36 +145,29 @@ class BMPONetwork(TensorNetwork):
     def update_distribution_params(
         self, 
         label: str, 
-        param1: Optional[torch.Tensor] = None, 
-        param2: Optional[torch.Tensor] = None
+        concentration: Optional[torch.Tensor] = None, 
+        rate: Optional[torch.Tensor] = None
     ) -> None:
         """
-        Update Gamma distribution parameters for a dimension.
+        Update Gamma distribution parameters for a bond.
         
         Args:
-            label: Dimension label
-            param1: For rank: c values; For vertical: f values
-            param2: For rank: e values; For vertical: g values
+            label: Bond label
+            concentration: Concentration parameters (α) for each index
+            rate: Rate parameters (β) for each index
         """
         if label not in self.distributions:
             raise ValueError(f"Label '{label}' not found in distributions")
         
         dist = self.distributions[label]
         
-        if dist['type'] == 'rank':
-            if param1 is not None:
-                dist['c'] = param1
-            if param2 is not None:
-                dist['e'] = param2
-            # Update expectation using mean() from GammaDistribution objects
-            self._update_expectations(label)
-        else:  # vertical
-            if param1 is not None:
-                dist['f'] = param1
-            if param2 is not None:
-                dist['g'] = param2
-            # Update expectation using mean() from GammaDistribution objects
-            self._update_expectations(label)
+        if concentration is not None:
+            dist['concentration'] = concentration
+        if rate is not None:
+            dist['rate'] = rate
+        
+        # Update expectations using mean() from GammaDistribution objects
+        self._update_expectations(label)
     
     def _update_expectations(self, label: str) -> None:
         """Update expectation values from Gamma distribution means."""
@@ -161,35 +178,26 @@ class BMPONetwork(TensorNetwork):
     
     def get_gamma_distributions(self, label: str) -> Optional[List[GammaDistribution]]:
         """
-        Get list of Gamma distribution objects for a dimension.
+        Get list of Gamma distribution objects for a bond.
         
         Args:
-            label: Dimension label
+            label: Bond label
             
         Returns:
-            List of GammaDistribution objects, one per index in dimension
+            List of GammaDistribution objects, one per index in the bond dimension
         """
         dist = self.distributions.get(label)
         if dist is None:
             return None
         
         distributions = []
-        if dist['type'] == 'rank':
-            # Gamma(c, e) for each index
-            for i in range(len(dist['c'])):
-                gamma = GammaDistribution(
-                    concentration=dist['c'][i],
-                    rate=dist['e'][i]
-                )
-                distributions.append(gamma)
-        else:  # vertical
-            # Gamma(f, g) for each index
-            for i in range(len(dist['f'])):
-                gamma = GammaDistribution(
-                    concentration=dist['f'][i],
-                    rate=dist['g'][i]
-                )
-                distributions.append(gamma)
+        # Unified structure: Gamma(concentration, rate) for each index
+        for i in range(len(dist['concentration'])):
+            gamma = GammaDistribution(
+                concentration=dist['concentration'][i],
+                rate=dist['rate'][i]
+            )
+            distributions.append(gamma)
         
         return distributions
     
@@ -204,6 +212,69 @@ class BMPONetwork(TensorNetwork):
         if gammas is None:
             return None
         return ProductDistribution(gammas)  # type: ignore
+
+    def get_nodes_for_bond(self, label: str) -> List[int]:
+        """
+        Get list of node indices that share the given bond.
+        
+        Args:
+            label: Bond label
+            
+        Returns:
+            List of node indices (0-indexed) that contain this bond
+        """
+        return self.bond_to_nodes.get(label, [])
+    # TODO: Wouldnt this function work best if we get the expectations vector imagine we have -> block_labels = r1 d1 r2, excluded_labels=d1, theta = torch.einsum(i,j -> ij).unsqueeze(1) ? only if there is a symbolic label way to do it.
+    def compute_theta_tensor(self, block_idx: int, exclude_labels: Optional[List[str]] = None) -> torch.Tensor:
+        """
+        Compute the Theta tensor for a block from expectations of Gamma distributions.
+        
+        Theta is the tensor product of E_q[X] for each bond in the block.
+        For block with bonds [r1, d1, r2]: Theta_{ijk} = E_q[r1]_i × E_q[d1]_j × E_q[r2]_k
+        
+        Args:
+            block_idx: Index of the block (0 to N-1)
+            exclude_labels: List of bond labels to exclude (set their dimension to 1)
+                           Example: exclude=['d1'] sets that dimension to 1
+                           
+        Returns:
+            Theta tensor with shape matching the block shape, where excluded
+            dimensions have size 1
+            
+        Example:
+            # Block 2 has bonds ['r1', 'd1', 'r2'] with shape (4, 5, 4)
+            theta = bmpo.compute_theta_tensor(2)  
+            # Returns tensor of shape (4, 5, 4) = outer product of expectations
+            
+            theta_excl = bmpo.compute_theta_tensor(2, exclude_labels=['d1'])
+            # Returns tensor of shape (4, 1, 4), middle dimension set to 1
+        """
+        if exclude_labels is None:
+            exclude_labels = []
+        
+        node = self.main_nodes[block_idx]
+        
+        # Start with scalar 1
+        theta = torch.tensor(1.0, dtype=node.tensor.dtype, device=node.tensor.device)
+        
+        # Compute the outer product iteratively
+        for label, size in zip(node.dim_labels, node.shape):
+            if label in exclude_labels:
+                # Excluded: use vector of ones with size 1
+                factor = torch.ones(1, dtype=node.tensor.dtype, device=node.tensor.device)
+            else:
+                # Get expectations for this bond
+                if label in self.distributions:
+                    factor = self.distributions[label]['expectation']
+                else:
+                    # Dummy index (size 1, no Gamma dist): use 1
+                    factor = torch.ones(size, dtype=node.tensor.dtype, device=node.tensor.device)
+            
+            # Outer product: expand dimensions and multiply
+            # theta: (...), factor: (n) -> theta: (..., 1), factor: (n) -> result: (..., n)
+            theta = theta.unsqueeze(-1) * factor
+        
+        return theta * 0.5
     
     def compute_entropy(self, label: str) -> Union[torch.Tensor, None]:
         """
@@ -236,7 +307,7 @@ class BMPONetwork(TensorNetwork):
         """
         Trim all nodes in the network based on expectation value thresholds.
         
-        For each dimension label, keeps only indices where E[ω] or E[φ] >= threshold.
+        For each dimension label, keeps only indices where E[X] >= threshold.
         Trims tensors and distribution parameters accordingly.
         
         Args:
@@ -260,13 +331,9 @@ class BMPONetwork(TensorNetwork):
             
             keep_indices[label] = indices
             
-            # Trim distribution parameters
-            if dist['type'] == 'rank':
-                dist['c'] = dist['c'][indices]
-                dist['e'] = dist['e'][indices]
-            else:  # vertical
-                dist['f'] = dist['f'][indices]
-                dist['g'] = dist['g'][indices]
+            # Trim distribution parameters (unified structure)
+            dist['concentration'] = dist['concentration'][indices]
+            dist['rate'] = dist['rate'][indices]
             dist['expectation'] = dist['expectation'][indices]
         
         # Trim all node tensors

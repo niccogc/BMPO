@@ -190,6 +190,122 @@ class BayesianMPO:
             
             # Set the Σ-node tensor
             sigma_node.tensor = sigma_permuted
+
+    def _get_sigma_to_mu_permutation(self, block_idx: int) -> Tuple[List[int], List[int]]:
+        """
+        Get permutation to reshape Σ-block to match μ-block structure using labels.
+        
+        Σ-node has labels like ['r1o', 'r1i', 'c2o', 'c2i', 'p2o', 'p2i', 'r2o', 'r2i']
+        μ-node has labels like ['r1', 'c2', 'p2', 'r2']
+        
+        This function finds which Σ dimensions correspond to outer and inner for each μ dimension.
+        
+        Args:
+            block_idx: Index of the block
+            
+        Returns:
+            Tuple of (outer_indices, inner_indices) where:
+            - outer_indices[i] is the Σ dimension for μ dimension i (outer)
+            - inner_indices[i] is the Σ dimension for μ dimension i (inner)
+            
+        Example:
+            μ labels: ['r1', 'c2', 'p2', 'r2']
+            Σ labels: ['r1o', 'r1i', 'c2o', 'c2i', 'p2o', 'p2i', 'r2o', 'r2i']
+            Returns: ([0, 2, 4, 6], [1, 3, 5, 7])
+        """
+        mu_node = self.mu_nodes[block_idx]
+        sigma_node = self.sigma_nodes[block_idx]
+        
+        outer_indices = []
+        inner_indices = []
+        
+        for mu_label in mu_node.dim_labels:
+            # Find corresponding 'o' and 'i' labels in sigma
+            label_o = f"{mu_label}o"
+            label_i = f"{mu_label}i"
+            
+            # Get their indices in sigma
+            try:
+                idx_o = sigma_node.dim_labels.index(label_o)
+                idx_i = sigma_node.dim_labels.index(label_i)
+            except ValueError as e:
+                raise ValueError(f"Cannot find labels {label_o} or {label_i} in Σ-node labels {sigma_node.dim_labels}")
+            
+            outer_indices.append(idx_o)
+            inner_indices.append(idx_i)
+        
+        return outer_indices, inner_indices
+    
+    def _sigma_to_matrix(self, block_idx: int) -> torch.Tensor:
+        """
+        Convert Σ-block tensor to (d, d) matrix using label-based permutation.
+        
+        Uses labels to correctly identify outer and inner dimensions, then
+        permutes to group them and reshapes to matrix form.
+        
+        Args:
+            block_idx: Index of the block
+            
+        Returns:
+            Matrix of shape (d, d) where d is the flattened size of μ-block
+        """
+        mu_node = self.mu_nodes[block_idx]
+        sigma_node = self.sigma_nodes[block_idx]
+        
+        # Get permutation using labels
+        outer_indices, inner_indices = self._get_sigma_to_mu_permutation(block_idx)
+        
+        # Permute: [outer dims, then inner dims]
+        perm = outer_indices + inner_indices
+        sigma_permuted = sigma_node.tensor.permute(*perm)
+        
+        # Reshape to (d, d)
+        d = mu_node.tensor.numel()
+        sigma_matrix = sigma_permuted.reshape(d, d)
+        
+        return sigma_matrix
+
+    def _matrix_to_sigma(self, block_idx: int, matrix: torch.Tensor) -> torch.Tensor:
+        """
+        Convert (d, d) matrix back to Σ-block tensor shape.
+        
+        This is the inverse operation of _sigma_to_matrix.
+        
+        Args:
+            block_idx: Index of the block
+            matrix: Matrix of shape (d, d)
+            
+        Returns:
+            Tensor with Σ-block shape (d1_o, d1_i, d2_o, d2_i, ...)
+        """
+        mu_node = self.mu_nodes[block_idx]
+        sigma_node = self.sigma_nodes[block_idx]
+        
+        mu_shape = mu_node.shape
+        d = mu_node.tensor.numel()
+        n_dims = len(mu_shape)
+        
+        # Reshape matrix (d, d) to grouped form
+        # First: (d, d) -> (d1, d2, ..., d1, d2, ...)
+        expanded_shape = list(mu_shape) + list(mu_shape)
+        matrix_expanded = matrix.reshape(*expanded_shape)
+        
+        # Get inverse permutation
+        # Forward was: outer_indices + inner_indices
+        # Inverse: interleave them back
+        outer_indices, inner_indices = self._get_sigma_to_mu_permutation(block_idx)
+        
+        # Create inverse permutation
+        # We went from interleaved [o, i, o, i, ...] to grouped [o, o, ..., i, i, ...]
+        # Now go back: from grouped to interleaved
+        inv_perm = [0] * (2 * n_dims)
+        for i, (o_idx, i_idx) in enumerate(zip(outer_indices, inner_indices)):
+            inv_perm[o_idx] = i  # Outer goes to position i
+            inv_perm[i_idx] = i + n_dims  # Inner goes to position i + n_dims
+        
+        sigma_tensor = matrix_expanded.permute(*inv_perm)
+        
+        return sigma_tensor
     
     def _initialize_prior_hyperparameters(self) -> None:
         """
@@ -199,7 +315,7 @@ class BayesianMPO:
         Default prior hyperparameters (uninformative/weakly informative):
         - p(τ) ~ Gamma(α₀=1, β₀=1)  - uninformative
         - p(Wᵢ) ~ N(0, σ₀²I) where σ₀²=10 - weakly informative, large variance
-        - p(ω), p(φ) ~ Gamma(1, 1) - uninformative
+        - p(bond params) ~ Gamma(1, 1) - uninformative, for each index in each bond
         
         These should be set via set_prior_hyperparameters() before running inference.
         """
@@ -207,24 +323,24 @@ class BayesianMPO:
         self.prior_tau_alpha = torch.tensor(1.0, dtype=self.tau_alpha.dtype, device=self.tau_alpha.device)
         self.prior_tau_beta = torch.tensor(1.0, dtype=self.tau_beta.dtype, device=self.tau_beta.device)
         
-        # Prior for mode parameters: uninformative Gamma(1, 1) for all dimensions
-        # Store as dict: {label: {'c0' or 'f0': tensor, 'e0' or 'g0': tensor}}
-        self.prior_mode_params = {}
+        # Prior for bond parameters: uninformative Gamma(1, 1) for all bonds
+        # Store as dict: {label: {'concentration0': tensor, 'rate0': tensor}}
+        # Each bond has N Gamma distributions (one per index)
+        self.prior_bond_params = {}
         for label, dist_info in self.mu_mpo.distributions.items():
             size = len(dist_info['expectation'])
-            if dist_info['type'] == 'rank':
-                self.prior_mode_params[label] = {
-                    'c0': torch.ones(size, dtype=dist_info['c'].dtype, device=dist_info['c'].device),
-                    'e0': torch.ones(size, dtype=dist_info['e'].dtype, device=dist_info['e'].device)
-                }
-            else:  # vertical
-                self.prior_mode_params[label] = {
-                    'f0': torch.ones(size, dtype=dist_info['f'].dtype, device=dist_info['f'].device),
-                    'g0': torch.ones(size, dtype=dist_info['g'].dtype, device=dist_info['g'].device)
-                }
+            self.prior_bond_params[label] = {
+                'concentration0': torch.ones(size, dtype=dist_info['concentration'].dtype, 
+                                            device=dist_info['concentration'].device),
+                'rate0': torch.ones(size, dtype=dist_info['rate'].dtype, 
+                                   device=dist_info['rate'].device)
+            }
         
         # Prior for blocks: N(0, σ₀²I) with σ₀²=10 (weakly informative)
-        # TODO: Since the dimension of the Sigma block diverge very rapidly, and the sigma prior is just diagonal, it is not needed to expand it and store. we can simply store the diagonal values and If isomorphic, only the value of the variace without expliciting the identity. Prograpagte the usage of this logic for where it gets used. Also variance should be made as a choosable parameters.
+        # TODO: Since the dimension of the Sigma block diverge very rapidly, and the sigma prior is just diagonal, 
+        # it is not needed to expand it and store. we can simply store the diagonal values and If isomorphic, 
+        # only the value of the variance without expliciting the identity. Propagate the usage of this logic 
+        # for where it gets used. Also variance should be made as a choosable parameter.
         self.prior_block_sigma0 = []
         for mu_node in self.mu_nodes:
             d = mu_node.tensor.numel()
@@ -236,7 +352,7 @@ class BayesianMPO:
         self,
         tau_alpha0: Optional[torch.Tensor] = None,
         tau_beta0: Optional[torch.Tensor] = None,
-        mode_params0: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+        bond_params0: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
         block_sigma0: Optional[List[torch.Tensor]] = None
     ) -> None:
         """
@@ -245,16 +361,17 @@ class BayesianMPO:
         Args:
             tau_alpha0: Prior α₀ for p(τ) ~ Gamma(α₀, β₀)
             tau_beta0: Prior β₀ for p(τ) ~ Gamma(α₀, β₀)
-            mode_params0: Dict of prior parameters for modes, e.g.:
-                         {'r1': {'c0': tensor, 'e0': tensor}, 'f': {'f0': tensor, 'g0': tensor}}
+            bond_params0: Dict of prior parameters for bonds, e.g.:
+                         {'r1': {'concentration0': tensor, 'rate0': tensor}}
+                         Each tensor has length N (one param per index)
             block_sigma0: List of prior covariances Σ₀ for p(Wᵢ) ~ N(0, Σ₀)
         """
         if tau_alpha0 is not None:
             self.prior_tau_alpha = tau_alpha0
         if tau_beta0 is not None:
             self.prior_tau_beta = tau_beta0
-        if mode_params0 is not None:
-            self.prior_mode_params.update(mode_params0)
+        if bond_params0 is not None:
+            self.prior_bond_params.update(bond_params0)
         if block_sigma0 is not None:
             self.prior_block_sigma0 = block_sigma0
     
@@ -269,11 +386,488 @@ class BayesianMPO:
     def update_mu_params(
         self, 
         label: str, 
-        param1: Optional[torch.Tensor] = None, 
-        param2: Optional[torch.Tensor] = None
+        concentration: Optional[torch.Tensor] = None, 
+        rate: Optional[torch.Tensor] = None
     ) -> None:
-        """Update μ-MPO distribution parameters."""
-        self.mu_mpo.update_distribution_params(label, param1, param2)
+        """
+        Update μ-MPO distribution parameters for a bond.
+        
+        Args:
+            label: Bond label
+            concentration: Concentration parameters (α)
+            rate: Rate parameters (β)
+        """
+        self.mu_mpo.update_distribution_params(label, concentration, rate)
+
+    def get_nodes_for_bond(self, label: str) -> Dict[str, List[int]]:
+        """
+        Get node indices associated with a given bond for both μ-MPO and Σ-MPO.
+        
+        Args:
+            label: Bond label (e.g., 'r1', 'f1')
+            
+        Returns:
+            Dictionary with keys:
+            - 'mu_nodes': List of μ-MPO node indices sharing this bond
+            - 'sigma_nodes': List of Σ-MPO node indices sharing this bond (same as mu_nodes)
+        """
+        mu_node_indices = self.mu_mpo.get_nodes_for_bond(label)
+        
+        # Σ-MPO nodes correspond 1-to-1 with μ-MPO nodes
+        # The same node indices apply to both
+        sigma_node_indices = mu_node_indices.copy()
+        
+        return {
+            'mu_nodes': mu_node_indices,
+            'sigma_nodes': sigma_node_indices
+        }
+
+    def compute_theta_tensor(self, block_idx: int, exclude_labels: Optional[List[str]] = None) -> torch.Tensor:
+        """
+        Compute the Theta tensor for a μ-MPO block from Gamma expectations.
+        
+        Theta_{ijk...} = E_q[bond1]_i × E_q[bond2]_j × E_q[bond3]_k × ...
+        
+        Args:
+            block_idx: Index of the μ-MPO block (0 to N-1)
+            exclude_labels: List of bond labels to exclude (set to dimension 1)
+            
+        Returns:
+            Theta tensor matching the block shape
+            
+        Example:
+            # Block 1 has bonds ['r1', 'c2', 'p2', 'r2'] with shape (4, 1, 5, 4)
+            theta = bmpo.compute_theta_tensor(1)
+            # Shape: (4, 1, 5, 4) from outer product of [E[r1], 1, E[p2], E[r2]]
+            
+            theta_no_p = bmpo.compute_theta_tensor(1, exclude_labels=['p2'])
+            # Shape: (4, 1, 1, 4), excludes p2 contribution
+        """
+        return self.mu_mpo.compute_theta_tensor(block_idx, exclude_labels)
+
+    def partial_trace_update(self, block_idx: int, focus_label: str) -> torch.Tensor:
+        """
+        Compute partial trace for variational update of a specific bond.
+        
+        This computes: Σ_{other indices} [diag(Σ) + μ²] × Θ_{without focus_label}
+        
+        where the sum is over all dimensions except focus_label, and the multiplication
+        aligns matching labels.
+        
+        Algorithm:
+        1. Get diagonal of Σ-block: diag(Σ_{ijk...} with paired (io, ii))
+        2. Add μ² element-wise: v = diag(Σ) + μ²
+        3. Get Θ excluding focus_label
+        4. Multiply: v × Θ (element-wise, matching dimensions)
+        5. Sum over all dimensions except focus_label
+        
+        Args:
+            block_idx: Index of the block
+            focus_label: The bond label to keep (not sum over)
+            
+        Returns:
+            Vector of length equal to the dimension of focus_label
+            
+        Example:
+            Block has shape (4, 1, 5, 4) with labels ['r1', 'c2', 'p2', 'r2']
+            partial_trace_update(1, 'p2') returns vector of length 5
+            
+            This computes: Σ_{i,j,k} [diag(Σ) + μ²]_{ijk𝓁} × Θ_{ijk𝓁 without p2}
+            where the sum is over r1(i), c2(j), r2(k), keeping only p2(𝓁)
+        """
+        mu_node = self.mu_nodes[block_idx]
+        
+        # Check that focus_label is in this block
+        if focus_label not in mu_node.dim_labels:
+            raise ValueError(f"Label '{focus_label}' not found in block {block_idx}. "
+                           f"Available labels: {mu_node.dim_labels}")
+        
+        # Step 1: Extract diagonal of Σ-block using label-based method
+        sigma_matrix = self._sigma_to_matrix(block_idx)  # Shape: (d, d)
+        diag_sigma_flat = torch.diagonal(sigma_matrix)  # Shape: (d,)
+        
+        # Reshape back to block shape
+        mu_shape = mu_node.shape
+        diag_sigma = diag_sigma_flat.reshape(mu_shape)
+        
+        # Step 2: Add μ² element-wise
+        mu_tensor = mu_node.tensor
+        v = diag_sigma + mu_tensor ** 2  # Shape: same as mu_shape
+        
+        # Step 3: Get Θ excluding focus_label
+        theta = self.compute_theta_tensor(block_idx, exclude_labels=[focus_label])
+        # Theta has shape where focus_label dimension is 1
+        
+        # Step 4: Multiply element-wise (broadcasting handles the dimension of size 1)
+        result = v * theta  # Shape: same as mu_shape
+        
+        # Step 5: Sum over all dimensions except focus_label
+        # Find which dimension index corresponds to focus_label
+        focus_dim_idx = mu_node.dim_labels.index(focus_label)
+        
+        # Sum over all dimensions except focus_dim_idx
+        dims_to_sum = [i for i in range(len(mu_shape)) if i != focus_dim_idx]
+        output = torch.sum(result, dim=dims_to_sum)
+        
+        return output
+
+    def update_bond_variational(self, label: str) -> None:
+        """
+        Variational update for a bond's Gamma distribution parameters.
+        
+        Updates q(bond) ~ Gamma(concentration_q, rate_q) based on the current
+        μ and Σ values.
+        
+        Update formulas:
+        - concentration_q = concentration_p + N_b × dim(bond)
+        - rate_q = rate_p - Σ_{blocks with bond} partial_trace_update(block, label)
+        
+        where:
+        - N_b is the number of learnable blocks associated with the bond (1 or 2)
+        - dim(bond) is the dimension size of the bond
+        - concentration_p, rate_p are prior hyperparameters
+        - partial_trace_update contracts over all dimensions except the bond
+        
+        Args:
+            label: Bond label to update (e.g., 'r1', 'p2')
+            
+        Example:
+            # Bond 'r1' connects blocks [0, 1], has dimension 4
+            bmpo.update_bond_variational('r1')
+            
+            # Updates:
+            # concentration_q = concentration_p + 2 × 4 = concentration_p + 8
+            # rate_q = rate_p - partial_trace(block=0, 'r1') 
+            #                 - partial_trace(block=1, 'r1')
+        """
+        # Check that the bond exists and has Gamma distribution
+        if label not in self.mu_mpo.distributions:
+            raise ValueError(f"Bond '{label}' not found in distributions. "
+                           f"Available bonds: {list(self.mu_mpo.distributions.keys())}")
+        
+        # Get bond information
+        bond_dist = self.mu_mpo.distributions[label]
+        bond_size = len(bond_dist['concentration'])
+        
+        # Get blocks associated with this bond
+        nodes_info = self.get_nodes_for_bond(label)
+        block_indices = nodes_info['mu_nodes']
+        N_b = len(block_indices)  # Number of blocks (1 or 2)
+        
+        # Get prior parameters
+        if label not in self.prior_bond_params:
+            raise ValueError(f"No prior parameters found for bond '{label}'")
+        
+        prior_params = self.prior_bond_params[label]
+        concentration_p = prior_params['concentration0']  # Shape: (bond_size,)
+        rate_p = prior_params['rate0']  # Shape: (bond_size,)
+        
+        # Update formula 1: concentration_q = concentration_p + N_b × dim(bond)
+        concentration_q = concentration_p + N_b * bond_size
+        
+        # Update formula 2: rate_q = rate_p - Σ_{blocks} partial_trace_update
+        rate_q = rate_p.clone()
+        
+        for block_idx in block_indices:
+            # Compute partial trace for this block with focus on the bond
+            partial_trace = self.partial_trace_update(block_idx, label)
+            # Shape: (bond_size,)
+            
+            # ADD to rate_q
+            rate_q = rate_q + partial_trace
+        
+        # Update the bond parameters
+        self.update_mu_params(label, concentration=concentration_q, rate=rate_q)
+
+    def _compute_mu_jacobian_outer(
+        self,
+        node: TensorNode,
+        network: 'TensorNetwork',
+        output_shape: tuple
+    ) -> torch.Tensor:
+        """
+        Compute Σₙ J_μ(xₙ) ⊗ J_μ(xₙ) - outer product of Jacobian with itself.
+        
+        This is J^T @ J summed over samples, without hessian weighting.
+        """
+        from tensor.utils import EinsumLabeler
+        
+        # Get Jacobian
+        J = network.compute_jacobian_stack(node).copy()
+        
+        # Expand to include output labels
+        J = J.expand_labels(network.output_labels, output_shape)
+        
+        broadcast_dims = tuple(d for d in network.output_labels if d not in node.dim_labels)
+        J = J.permute_first(*broadcast_dims)
+        
+        # Build einsum for J^T @ J
+        dim_labels = EinsumLabeler()
+        
+        J_ein1 = ''.join([dim_labels[d] for d in J.dim_labels])
+        J_ein2 = ''.join([dim_labels['_' + d] if d != network.sample_dim else dim_labels[d] for d in J.dim_labels])
+        
+        # Output: node dimensions twice
+        J_out1 = []
+        J_out2 = []
+        dim_order = []
+        for d in J.dim_labels:
+            if d not in broadcast_dims:
+                J_out1.append(dim_labels[d])
+                J_out2.append(dim_labels['_' + d])
+                dim_order.append(d)
+        
+        out1 = ''.join([J_out1[dim_order.index(d)] for d in node.dim_labels])
+        out2 = ''.join([J_out2[dim_order.index(d)] for d in node.dim_labels])
+        
+        # Einsum: sum over samples, outer product over node dims
+        einsum_str = f'{J_ein1},{J_ein2}->{out1}{out2}'
+        
+        A = torch.einsum(einsum_str, J.tensor.conj(), J.tensor)
+        
+        return A
+    
+    def _compute_forward_without_node(
+        self,
+        node: TensorNode,
+        network: 'TensorNetwork'
+    ) -> TensorNode:
+        """
+        Compute forward pass through network without contracting a specific node.
+        
+        This gives us the Jacobian: when contracted with the node, produces the output.
+        Uses left and right stacks for efficient computation.
+        
+        Args:
+            node: Node to exclude from contraction
+            network: TensorNetwork (mu_mpo or sigma_mpo)
+            
+        Returns:
+            Jacobian as TensorNode
+        """
+        # Get left and right stacks
+        if network.left_stacks is None or network.right_stacks is None:
+            network.recompute_all_stacks()
+        
+        left_stack, right_stack = network.get_stacks(node)
+        
+        # Get column nodes (vertical connections)
+        column_nodes = network.get_column_nodes(node)
+        
+        # Start with left stack (or first column node if no left stack)
+        node_iter = iter(column_nodes)
+        contracted = next(node_iter) if left_stack is None else left_stack
+        
+        # Contract with remaining column nodes
+        for vnode in node_iter:
+            contracted = contracted.contract_with(vnode, vnode.get_connecting_labels(contracted))
+        
+        # Contract with right stack
+        if right_stack is not None:
+            contracted = contracted.contract_with(right_stack, right_stack.get_connecting_labels(contracted))
+        
+        return contracted
+    
+    def _compute_jacobian_y_contraction(
+        self,
+        node: TensorNode,
+        y: torch.Tensor,
+        network: 'TensorNetwork'
+    ) -> torch.Tensor:
+        """
+        Compute Σₙ yₙ · J(xₙ) where J is the Jacobian (forward without node).
+        
+        This contracts J with y over the sample dimension, leaving node dimensions.
+        """
+        from tensor.utils import EinsumLabeler
+        
+        # Get Jacobian: network output without this node
+        J = self._compute_forward_without_node(node, network)
+        
+        # J has sample dimension 's' and dimensions from other parts of network
+        # We need to contract J with y over samples, leaving only node-shaped output
+        
+        # Build einsum string
+        labeler = EinsumLabeler()
+        
+        # J einsum string
+        J_ein = ''.join([labeler[d] for d in J.dim_labels])
+        
+        # y einsum string (sample dimension)
+        y_ein = labeler['s']  # y has shape (S,) or (S, 1)
+        
+        # Output: only dimensions that are in the node
+        out_dims = []
+        for d in J.dim_labels:
+            if d != 's' and d in node.dim_labels:
+                out_dims.append(d)
+        out_ein = ''.join([labeler[d] for d in out_dims])
+        
+        # Contract: sum over samples and any non-node dimensions
+        einsum_str = f"{J_ein},{y_ein}->{out_ein}"
+        
+        result = torch.einsum(einsum_str, J.tensor, y.squeeze(-1) if y.dim() > 1 else y)
+        
+        return result
+    
+    def _compute_jacobian_outer_product(
+        self,
+        node: TensorNode,
+        network: 'TensorNetwork'
+    ) -> torch.Tensor:
+        """
+        Compute Σₙ J(xₙ) ⊗ J(xₙ) where J is the Jacobian.
+        
+        This computes J^T @ J contracted over samples, leaving (node_dims, node_dims).
+        """
+        from tensor.utils import EinsumLabeler
+        
+        # Get Jacobian
+        J = self._compute_forward_without_node(node, network)
+        
+        # Build einsum for outer product
+        labeler = EinsumLabeler()
+        
+        # J einsum strings (same J used twice with different labels for outer product)
+        J_ein1 = ''.join([labeler[d] for d in J.dim_labels])
+        J_ein2 = ''.join([labeler['_' + d] if d != 's' else labeler[d] for d in J.dim_labels])
+        
+        # Output: node dimensions twice (outer product)
+        out_dims1 = [d for d in J.dim_labels if d != 's' and d in node.dim_labels]
+        out_dims2 = ['_' + d for d in out_dims1]
+        out_ein = ''.join([labeler[d] for d in out_dims1]) + ''.join([labeler[d] for d in out_dims2])
+        
+        # Contract
+        einsum_str = f"{J_ein1},{J_ein2}->{out_ein}"
+        
+        result = torch.einsum(einsum_str, J.tensor, J.tensor)
+        
+        return result
+    
+    def update_block_variational(
+        self, 
+        block_idx: int, 
+        X: torch.Tensor, 
+        y: torch.Tensor
+    ) -> None:
+        """
+        Variational update for a block's parameters (μ and Σ).
+        
+        Updates the natural parameters for block χⁱ based on data (X, y).
+        
+        Update equations:
+        - μ^χⁱ = -E[τ] Σ^χⁱ Σₙ yₙ · J_μ(xₙ)
+        - Σ^χⁱ⁻¹ = -E[τ] Σₙ [J_Σ(xₙ) + J_μ(xₙ) ⊗ J_μ(xₙ)] - diag(Θ)
+        
+        where:
+        - J_μ(xₙ) = ∂/∂χⁱ μ(xₙ) is the μ-Jacobian (network with block i removed)
+        - J_Σ(xₙ) = ∂/∂χⁱ Σ(xₙ⊗xₙ) is the Σ-Jacobian
+        - Θ = theta tensor (outer product of Gamma expectations)
+        - diag(Θ) = diagonal matrix from Θ
+        
+        Args:
+            block_idx: Index of the block to update (0 to N-1)
+            X: Input data, shape (S, feature_dims) where S is number of samples
+            y: Target data, shape (S,) for scalar outputs
+            
+        Example:
+            # Update block 1 with training data
+            bmpo.update_block_variational(1, X_train, y_train)
+        """
+        mu_node = self.mu_nodes[block_idx]
+        sigma_node = self.sigma_nodes[block_idx]
+        
+        # Get E[τ]
+        E_tau = self.get_tau_mean()
+        
+        # Flatten block shape
+        d = mu_node.tensor.numel()
+        mu_shape = mu_node.shape
+        
+        # Get Theta tensor (prior precision diagonal)
+        theta = self.compute_theta_tensor(block_idx)  # Shape: mu_shape
+        theta_flat = theta.flatten()  # Shape: (d,) - just keep as vector
+        
+        # Forward pass through μ-MPO to set up network state with all samples
+        mu_output = self.forward_mu(X, to_tensor=False)
+        
+        # Set output_labels to match actual output
+        self.mu_mpo.output_labels = tuple(mu_output.dim_labels)
+        
+        # Prepare y with proper shape to match output dimensions
+        # Output has shape (S, r0, r2) so y should be (S, 1, 1)
+        y_expanded = y
+        for _ in range(len(mu_output.shape) - 1):  # Add dims for each non-sample dim
+            y_expanded = y_expanded.unsqueeze(-1)
+        
+        # Compute J_μ terms
+        # For the b term: Σₙ yₙ · J_μ(xₙ)
+        sum_y_dot_J_mu = self.mu_mpo.get_b(mu_node, y_expanded)
+        
+        # For the A term: Σₙ J_μ(xₙ) ⊗ J_μ(xₙ) - outer product without hessian
+        J_mu_outer = self._compute_mu_jacobian_outer(mu_node, self.mu_mpo, mu_output.shape)
+        
+        # Flatten results
+        sum_y_dot_J_mu_flat = sum_y_dot_J_mu.flatten()  # Shape: (d,)
+        n_dims = len(mu_shape)
+        J_mu_outer_flat = J_mu_outer.flatten(0, n_dims-1).flatten(1, -1)  # Shape: (d, d)
+        
+        # Compute J_Σ term for Σ-MPO
+        # J_Σ is just the Jacobian contracted over samples: Σₙ J_Σ(xₙ)
+        # This is the b term from get_b for Σ-MPO
+        sigma_output = self.forward_sigma(X, to_tensor=False)
+        self.sigma_mpo.output_labels = tuple(sigma_output.dim_labels)
+        
+        # Create y_sigma matching sigma output shape (all ones to get Jacobian sum)
+        y_sigma = torch.ones(sigma_output.shape, dtype=mu_node.tensor.dtype, device=mu_node.tensor.device)
+        
+        # Get J_Σ term using get_b - returns tensor with Σ-node shape
+        J_sigma_sum = self.sigma_mpo.get_b(sigma_node, y_sigma)
+        
+        # Convert J_Σ from Σ-block shape to (d, d) matrix using existing method
+        # J_sigma_sum has shape like (d1o, d1i, d2o, d2i, ...)
+        # We need to reshape it to (d, d) where d = d1*d2*...
+        # Use the same logic as _sigma_to_matrix but for the Jacobian
+        sigma_matrix = self._sigma_to_matrix(block_idx)  # Get current Σ as (d, d)
+        # J_sigma_sum should have same structure, reshape it the same way
+        # Actually J_sigma_sum already has the right shape, just need to flatten properly
+        
+        # Get permutation to convert to matrix form
+        outer_indices, inner_indices = self._get_sigma_to_mu_permutation(block_idx)
+        perm = outer_indices + inner_indices
+        J_sigma_permuted = J_sigma_sum.permute(*perm)
+        sum_J_sigma = J_sigma_permuted.reshape(d, d)
+        
+        # Compute covariance inverse: Σ^⁻¹ = -E[τ] Σₙ [J_Σ(xₙ) + J_μ(xₙ) ⊗ J_μ(xₙ)] - diag(Θ)
+        # Compute without diag first
+        sigma_inv = -E_tau * (sum_J_sigma + J_mu_outer_flat)
+        
+        # Add diagonal terms: -diag(Θ) and regularization
+        # Avoid creating full diagonal matrix, just subtract from diagonal
+        eps = 1e-6
+        diagonal_correction = theta_flat + eps
+        sigma_inv.diagonal().sub_(diagonal_correction)
+        
+        # Compute covariance: Σ = (Σ^⁻¹)^⁻¹
+        sigma_cov = torch.inverse(sigma_inv)
+        
+        # Compute mean: μ = -E[τ] Σ Σₙ yₙ · J_μ(xₙ)
+        mu_flat = -E_tau * torch.matmul(sigma_cov, sum_y_dot_J_mu_flat)
+        
+        # Reshape back to block shape
+        mu_new = mu_flat.reshape(mu_shape)
+        
+        # Update μ-block
+        mu_node.tensor = mu_new
+        
+        # Update Σ-block
+        # Convert sigma_cov (d, d) back to Σ-block shape
+        sigma_new = self._matrix_to_sigma(block_idx, sigma_cov)
+        sigma_node.tensor = sigma_new
+        
+        # Reset stacks after update
+        self.mu_mpo.reset_stacks()
+        self.sigma_mpo.reset_stacks()
     
     def update_tau(
         self, 
@@ -297,6 +891,99 @@ class BayesianMPO:
             rate=self.tau_beta
         )
 
+    def fit(
+        self,
+        X: torch.Tensor,
+        y: torch.Tensor,
+        max_iter: int = 100,
+        tol: float = 1e-6,
+        trim_threshold: Optional[float] = None,
+        verbose: bool = True
+    ) -> None:
+        """
+        Fit the Bayesian MPO using coordinate ascent variational inference.
+        
+        Update routine:
+        1. Update all blocks (μ, Σ parameters)
+        2. Update all bond distributions (Gamma parameters)
+        3. Update τ (precision parameter)
+        4. Trim (optional)
+        5. Repeat until convergence
+        
+        Args:
+            X: Input data, shape (S, feature_dims)
+            y: Target data, shape (S,)
+            max_iter: Maximum number of iterations
+            tol: Convergence tolerance (not implemented yet - always runs max_iter)
+            trim_threshold: If provided, trim bonds with E[X] < threshold after each iteration
+            verbose: Print progress
+            
+        Example:
+            bmpo.fit(X_train, y_train, max_iter=50, verbose=True)
+        """
+        if verbose:
+            print('='*70)
+            print('BAYESIAN MPO COORDINATE ASCENT')
+            print('='*70)
+            print(f'Data: {X.shape[0]} samples, {X.shape[1]} features')
+            print(f'Blocks: {len(self.mu_nodes)}')
+            print(f'Max iterations: {max_iter}')
+            if trim_threshold is not None:
+                print(f'Trim threshold: {trim_threshold}')
+            print('='*70)
+            print()
+        
+        for iteration in range(max_iter):
+            if verbose:
+                print(f'Iteration {iteration + 1}/{max_iter}')
+            
+            # Step 1: Update all blocks (μ, Σ)
+            if verbose:
+                print('  Updating blocks...', end='')
+            for block_idx in range(len(self.mu_nodes)):
+                self.update_block_variational(block_idx, X, y)
+            if verbose:
+                print(' ✓')
+            
+            # Step 2: Update all bond distributions (Gamma parameters)
+            if verbose:
+                print('  Updating bonds...', end='')
+            # Get all bond labels (rank labels)
+            bond_labels = list(self.mu_mpo.distributions.keys())
+            for label in bond_labels:
+                self.update_bond_variational(label)
+            if verbose:
+                print(f' ✓ ({len(bond_labels)} bonds)')
+            
+            # Step 3: Update τ (precision)
+            if verbose:
+                print('  Updating τ...', end='')
+            self.update_tau_variational(X, y)
+            tau_mean = self.get_tau_mean().item()
+            if verbose:
+                print(f' ✓ (E[τ] = {tau_mean:.4f})')
+            
+            # Step 4: Trim (optional)
+            if trim_threshold is not None:
+                if verbose:
+                    print('  Trimming...', end='')
+                # Build threshold dict for all bonds
+                trim_thresholds = {label: trim_threshold for label in bond_labels}
+                self.trim(trim_thresholds)
+                if verbose:
+                    print(' ✓')
+            
+            # TODO: Compute ELBO for convergence check
+            # For now, just run for max_iter iterations
+            
+            if verbose:
+                print()
+        
+        if verbose:
+            print('='*70)
+            print('TRAINING COMPLETE')
+            print('='*70)
+    
     def update_tau_variational(
         self,
         X: torch.Tensor,
@@ -333,8 +1020,10 @@ class BayesianMPO:
         
         # Term 2: Σ_s[y_s · μ(x_s)]
         # Forward pass through μ-MPO for all samples at once
-        mu_output = self.forward_mu(X, to_tensor=True)  # Shape: (S, 1, 1, ...) 
-        mu_flat = mu_output.reshape(S, -1)  # (S, output_dim)
+        mu_output_result = self.forward_mu(X, to_tensor=True)  # Returns Tensor when to_tensor=True
+        # Type narrowing: when to_tensor=True, result is Tensor
+        assert isinstance(mu_output_result, torch.Tensor)
+        mu_flat = mu_output_result.reshape(S, -1)  # (S, output_dim)
         y_flat = y.reshape(S, -1)  # (S, output_dim)
         
         # Dot product: sum over all samples and output dimensions
@@ -342,10 +1031,12 @@ class BayesianMPO:
         
         # Term 3: 1/2 * Σ_s[Σ(x_s)]
         # Forward pass through Σ-MPO for all samples at once
-        sigma_output = self.forward_sigma(X, to_tensor=True)  # Shape: (S, 1, 1, ...)
+        sigma_output_result = self.forward_sigma(X, to_tensor=True)  # Returns Tensor when to_tensor=True
+        # Type narrowing: when to_tensor=True, result is Tensor
+        assert isinstance(sigma_output_result, torch.Tensor)
         
         # Sum over all samples and output dimensions (for scalar output, just sum all)
-        beta_q = beta_q + 0.5 * torch.sum(sigma_output)
+        beta_q = beta_q + 0.5 * torch.sum(sigma_output_result)
         
         # Update the parameters
         self.update_tau(alpha=alpha_q, beta=beta_q)
@@ -506,40 +1197,19 @@ class BayesianMPO:
             MultivariateGaussianDistribution for this block
         """
         mu_node = self.mu_nodes[block_idx]
-        sigma_node = self.sigma_nodes[block_idx]
         
         # Flatten μ block: E_q[W_i]
         mu_flat = mu_node.tensor.flatten()
         d = mu_flat.numel()
         
-        # Flatten Σ block to get E_q[W_i ⊗ W_i^T]
-        # Σ-node has shape (d1, d1, d2, d2, ...) -> reshape to (d, d)
-        sigma_tensor = sigma_node.tensor
-        
-        # Reshape: group 'o' and 'i' dimensions
-        # For each original dimension of size n, we have (n_o, n_i)
-        # We want to flatten to (d, d) where d = product of all n's
-        shape_half = mu_node.shape
-        
-        # Permute to group outer and inner: [d1_o, d2_o, ..., d1_i, d2_i, ...]
-        n_dims = len(shape_half)
-
-        # TODO: FIND OUTER AND INNER through label, not order.
-        outer_indices = list(range(0, 2*n_dims, 2))  # [0, 2, 4, ...]
-        inner_indices = list(range(1, 2*n_dims, 2))  # [1, 3, 5, ...]
-        perm = outer_indices + inner_indices
-        
-        sigma_permuted = sigma_tensor.permute(*perm)
-        
-        # Reshape to (d, d)
-        sigma_matrix = sigma_permuted.reshape(d, d)
+        # Convert Σ block to (d, d) matrix using label-based permutation
+        sigma_matrix = self._sigma_to_matrix(block_idx)
         
         # Compute covariance: Cov = E[W ⊗ W^T] - E[W] ⊗ E[W]^T
         mu_outer = torch.outer(mu_flat, mu_flat)
         covariance = sigma_matrix - mu_outer
         
         # Make symmetric to handle numerical errors (floating point precision)
-        # TODO: isnt this a waste since it should be symmetric?
         covariance = 0.5 * (covariance + covariance.T)
         
         return MultivariateGaussianDistribution(
@@ -743,38 +1413,35 @@ class BayesianMPO:
     
     def _expected_log_prior_modes(self) -> torch.Tensor:
         """
-        Compute E_q[log p(mode_params)] for all modes.
+        Compute E_q[log p(bond_params)] for all bonds.
         
         Uses the modular expected_log_prob method from GammaDistribution.
+        Each bond has N Gamma distributions (one per index).
         
         Returns:
-            Sum of E_q[log p(mode_param)] over all modes and indices
+            Sum of E_q[log p(bond_param)] over all bonds and indices
         """
-        log_p_modes_total = torch.tensor(0.0, dtype=self.tau_alpha.dtype, device=self.tau_alpha.device)
+        log_p_bonds_total = torch.tensor(0.0, dtype=self.tau_alpha.dtype, device=self.tau_alpha.device)
         
-        for label, prior_params in self.prior_mode_params.items():
+        for label, prior_params in self.prior_bond_params.items():
             # Get current variational distributions
             gammas_q = self.mu_mpo.get_gamma_distributions(label)
             if gammas_q is None:
                 continue
             
-            # Get prior parameters
-            if 'c0' in prior_params:  # rank dimension
-                alpha0 = prior_params['c0']
-                beta0 = prior_params['e0']
-            else:  # vertical dimension
-                alpha0 = prior_params['f0']
-                beta0 = prior_params['g0']
+            # Get prior parameters (unified structure)
+            concentration0 = prior_params['concentration0']
+            rate0 = prior_params['rate0']
             
-            # Compute E_q[log p(θ)] for each index in this dimension using modular method
+            # Compute E_q[log p(θ)] for each index in this bond using modular method
             for i, gamma_q in enumerate(gammas_q):
                 log_p_theta = gamma_q.expected_log_prob(
-                    concentration_p=alpha0[i],
-                    rate_p=beta0[i]
+                    concentration_p=concentration0[i],
+                    rate_p=rate0[i]
                 )
-                log_p_modes_total = log_p_modes_total + log_p_theta
+                log_p_bonds_total = log_p_bonds_total + log_p_theta
         
-        return log_p_modes_total
+        return log_p_bonds_total
     
     def summary(self) -> None:
         """Print summary of the Bayesian MPO structure."""

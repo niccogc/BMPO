@@ -125,8 +125,10 @@ def _build_mu_tensor_train(
         )
         
         # Squeeze output dimension if it's 1
+        # Don't exclude c{i+1} - we WANT to squeeze it if it's size 1
         if out_dim == 1:
-            node.squeeze(exclude={f'c{i+1}'})
+            # Squeeze all size-1 dimensions except bonds
+            node.squeeze(exclude={f'r{i}', f'r{i+1}'})
         
         mu_nodes.append(node)
     

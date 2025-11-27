@@ -35,6 +35,12 @@
     opencodecfg = pkgs.writeText "opencodecfg.jsonc" ''
       {
         "$schema": "https://opencode.ai/config.json",
+        "tui": {
+          "scroll_speed": 3,
+          "scroll_acceleration": {
+            "enabled": true
+          }
+        },
         "mcp": {
           "serena": {
             "type": "local",
@@ -50,55 +56,7 @@
               "ide-assistant"
             ],
             "enabled": true
-          },
-          "nixos": {
-            "type": "local",
-            "command": [
-              "mcp-nixos"
-            ],
-            "enabled": true
-          },
-          "zen": {
-            "type": "local",
-            "command": [
-              "${pkgs.uv}/bin/uvx",
-              "--from",
-              "git+https://github.com/BeehiveInnovations/zen-mcp-server.git",
-              "zen-mcp-server"
-            ],
-            "enabled": true
           }
-        }
-      }
-    '';
-
-    geminicfg = pkgs.writeText "gemini-settings.json" ''
-      {
-        "mcpServers": {
-          "serena": {
-            "type": "local",
-            "command": [
-              "${pkgs.uv}/bin/uvx",
-              "--python",
-              "${python}/bin/python",
-              "--from",
-              "git+https://github.com/oraios/serena",
-              "serena",
-              "start-mcp-server",
-              "--context",
-              "ide-assistant",
-              "--project",
-              "/etc/nixos/ai"
-            ],
-            "enabled": true
-          },
-          "nixos": {
-            "type": "local",
-            "command": [
-              "mcp-nixos"
-            ],
-            "enabled": true
-          },
         }
       }
     '';
@@ -111,7 +69,6 @@
       packages = [
         pythonWithNixPkgs
         pkgs.uv
-        pkgs.gemini-cli-bin
         pkgs.opencode
       ];
 
@@ -119,7 +76,6 @@
         export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [pkgs.stdenv.cc.cc.lib pkgs.zlib]}"
         export OPENCODE_CONFIG=${opencodecfg}
         export PROJECT_DIR=$PWD
-        export GEMINI_SETTINGS=${geminicfg}
 
         # Load GEMINI_API_KEY from sops-nix secrets
         GEMINI_API_KEY_FILE="$HOME/.config/sops-nix/secrets/geminiApi"
