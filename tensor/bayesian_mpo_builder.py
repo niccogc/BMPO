@@ -20,7 +20,9 @@ def create_bayesian_tensor_train(
     tau_alpha: Optional[torch.Tensor] = None,
     tau_beta: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = None,
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
+    random_priors: bool = False,
+    prior_seed: Optional[int] = None
 ) -> BayesianMPO:
     """
     Create a Bayesian MPO with Tensor Train (TT/MPS) structure.
@@ -38,7 +40,9 @@ def create_bayesian_tensor_train(
         tau_alpha: Alpha parameter for τ distribution
         tau_beta: Beta parameter for τ distribution
         dtype: Data type
-        seed: Random seed
+        seed: Random seed for network initialization
+        random_priors: If True, initialize priors randomly from uniform distributions
+        prior_seed: Random seed for prior initialization (if different from seed)
         
     Returns:
         BayesianMPO object with TT structure
@@ -76,6 +80,10 @@ def create_bayesian_tensor_train(
     
     # Re-discover nodes to include input nodes in the network
     bmpo.sigma_mpo.nodes, bmpo.sigma_mpo.node_indices = bmpo.sigma_mpo._discover_nodes()
+    
+    # Set random priors if requested
+    if random_priors:
+        bmpo.set_random_prior_hyperparameters(seed=prior_seed)
     
     return bmpo
 

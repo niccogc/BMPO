@@ -224,13 +224,15 @@ class BMPONetwork(TensorNetwork):
             List of node indices (0-indexed) that contain this bond
         """
         return self.bond_to_nodes.get(label, [])
-    # TODO: Wouldnt this function work best if we get the expectations vector imagine we have -> block_labels = r1 d1 r2, excluded_labels=d1, theta = torch.einsum(i,j -> ij).unsqueeze(1) ? only if there is a symbolic label way to do it.
+    
     def compute_theta_tensor(self, block_idx: int, exclude_labels: Optional[List[str]] = None) -> torch.Tensor:
         """
         Compute the Theta tensor for a block from expectations of Gamma distributions.
         
         Theta is the tensor product of E_q[X] for each bond in the block.
         For block with bonds [r1, d1, r2]: Theta_{ijk} = E_q[r1]_i × E_q[d1]_j × E_q[r2]_k
+        
+        OPTIMIZED: Uses einsum for efficient outer product computation when possible.
         
         Args:
             block_idx: Index of the block (0 to N-1)
@@ -254,10 +256,8 @@ class BMPONetwork(TensorNetwork):
         
         node = self.main_nodes[block_idx]
         
-        # Start with scalar 1
-        theta = torch.tensor(1.0, dtype=node.tensor.dtype, device=node.tensor.device)
-        
-        # Compute the outer product iteratively
+        # Collect factors (expectation vectors) for each dimension
+        factors = []
         for label, size in zip(node.dim_labels, node.shape):
             if label in exclude_labels:
                 # Excluded: use vector of ones with size 1
@@ -269,11 +269,27 @@ class BMPONetwork(TensorNetwork):
                 else:
                     # Dummy index (size 1, no Gamma dist): use 1
                     factor = torch.ones(size, dtype=node.tensor.dtype, device=node.tensor.device)
-            
-            # Outer product: expand dimensions and multiply
-            # theta: (...), factor: (n) -> theta: (..., 1), factor: (n) -> result: (..., n)
-            theta = theta.unsqueeze(-1) * factor
+            factors.append(factor)
         
+        # OPTIMIZATION: Use einsum for efficient outer product
+        # Generate einsum string: 'i,j,k->ijk' for 3D tensor
+        num_dims = len(factors)
+        
+        if num_dims == 0:
+            # Edge case: no dimensions
+            return torch.tensor(0.5, dtype=node.tensor.dtype, device=node.tensor.device)
+        elif num_dims == 1:
+            # Single dimension: just scale
+            return factors[0].unsqueeze(0) * 0.5 if factors[0].numel() == 1 else factors[0] * 0.5
+        else:
+            # Multiple dimensions: use einsum
+            # Create symbolic indices for each dimension
+            input_indices = ','.join([chr(97 + i) for i in range(num_dims)])  # 'a,b,c,...'
+            output_indices = ''.join([chr(97 + i) for i in range(num_dims)])   # 'abc...'
+            einsum_str = f'{input_indices}->{output_indices}'
+            
+            theta = torch.einsum(einsum_str, *factors)
+            
         return theta * 0.5
     
     def compute_entropy(self, label: str) -> Union[torch.Tensor, None]:

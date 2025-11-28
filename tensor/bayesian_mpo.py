@@ -314,7 +314,7 @@ class BayesianMPO:
         The prior should be set BEFORE variational parameters, as priors inform initialization.
         Default prior hyperparameters (uninformative/weakly informative):
         - p(τ) ~ Gamma(α₀=1, β₀=1)  - uninformative
-        - p(Wᵢ) ~ N(0, σ₀²I) where σ₀²=10 - weakly informative, large variance
+        - p(Wᵢ) ~ N(0, σ₀²I) where σ₀²=1 - weakly informative
         - p(bond params) ~ Gamma(1, 1) - uninformative, for each index in each bond
         
         These should be set via set_prior_hyperparameters() before running inference.
@@ -336,17 +336,81 @@ class BayesianMPO:
                                    device=dist_info['rate'].device)
             }
         
-        # Prior for blocks: N(0, σ₀²I) with σ₀²=10 (weakly informative)
-        # TODO: Since the dimension of the Sigma block diverge very rapidly, and the sigma prior is just diagonal, 
-        # it is not needed to expand it and store. we can simply store the diagonal values and If isomorphic, 
-        # only the value of the variance without expliciting the identity. Propagate the usage of this logic 
-        # for where it gets used. Also variance should be made as a choosable parameter.
-        self.prior_block_sigma0 = []
+        # Prior for blocks: N(0, σ₀²I) with σ₀²=1 (weakly informative)
+        # OPTIMIZATION: Store only the scalar variance σ₀² instead of full matrix
+        # This saves memory since the covariance is diagonal: Σ₀ = σ₀²I
+        self.prior_block_sigma0_scalar = []
+        self.prior_block_sigma0_isotropic = []  # Flag indicating if prior is isotropic (σ²I)
+        
         for mu_node in self.mu_nodes:
             d = mu_node.tensor.numel()
-            # Prior covariance: 10 * I (large variance, weakly informative)
-            sigma0 = 10.0 * torch.eye(d, dtype=mu_node.tensor.dtype, device=mu_node.tensor.device)
-            self.prior_block_sigma0.append(sigma0)
+            # Store scalar variance (isotropic prior)
+            sigma0_scalar = torch.tensor(1.0, dtype=mu_node.tensor.dtype, device=mu_node.tensor.device)
+            self.prior_block_sigma0_scalar.append(sigma0_scalar)
+            self.prior_block_sigma0_isotropic.append(True)
+        
+        # For backward compatibility, also maintain the old interface
+        # but compute matrices lazily only when needed
+        self.prior_block_sigma0 = None  # Will be computed on demand
+
+    def set_random_prior_hyperparameters(
+        self,
+        tau_alpha_range: tuple[float, float] = (0.5, 5.0),
+        tau_beta_range: tuple[float, float] = (0.5, 5.0),
+        bond_concentration_range: tuple[float, float] = (0.5, 5.0),
+        bond_rate_range: tuple[float, float] = (0.5, 5.0),
+        block_sigma_range: tuple[float, float] = (0.5, 10.0),
+        seed: Optional[int] = None
+    ) -> 'BayesianMPO':
+        """
+        Set random prior hyperparameters from uniform distributions.
+        
+        This creates more diverse priors instead of fixed uninformative priors.
+        
+        Args:
+            tau_alpha_range: Range for p(τ) ~ Gamma(α₀, β₀) concentration parameter
+            tau_beta_range: Range for p(τ) ~ Gamma(α₀, β₀) rate parameter
+            bond_concentration_range: Range for bond parameter Gamma concentrations
+            bond_rate_range: Range for bond parameter Gamma rates
+            block_sigma_range: Range for block prior variance diagonal values
+            seed: Random seed for reproducibility
+            
+        Returns:
+            self for chaining
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+        
+        # Random prior for τ: Gamma(α₀, β₀) with random α₀, β₀
+        self.prior_tau_alpha = torch.empty_like(self.tau_alpha).uniform_(*tau_alpha_range)
+        self.prior_tau_beta = torch.empty_like(self.tau_beta).uniform_(*tau_beta_range)
+        
+        # Random prior for bond parameters: Gamma with random parameters for each bond index
+        for label, dist_info in self.mu_mpo.distributions.items():
+            size = len(dist_info['expectation'])
+            self.prior_bond_params[label] = {
+                'concentration0': torch.empty(size, dtype=dist_info['concentration'].dtype,
+                                             device=dist_info['concentration'].device).uniform_(*bond_concentration_range),
+                'rate0': torch.empty(size, dtype=dist_info['rate'].dtype,
+                                    device=dist_info['rate'].device).uniform_(*bond_rate_range)
+            }
+        
+        # Random prior for blocks: N(0, σ₀²I) with random σ₀² per block
+        # OPTIMIZED: Store only scalar variance
+        self.prior_block_sigma0_scalar = []
+        self.prior_block_sigma0_isotropic = []
+        
+        for mu_node in self.mu_nodes:
+            # Random variance for each block (isotropic)
+            sigma0_scalar = torch.empty(1, dtype=mu_node.tensor.dtype, 
+                                       device=mu_node.tensor.device).uniform_(*block_sigma_range).squeeze()
+            self.prior_block_sigma0_scalar.append(sigma0_scalar)
+            self.prior_block_sigma0_isotropic.append(True)
+        
+        # Invalidate cached full matrices
+        self.prior_block_sigma0 = None
+        
+        return self
     
     def set_prior_hyperparameters(
         self,
@@ -756,8 +820,8 @@ class BayesianMPO:
         Updates the natural parameters for block χⁱ based on data (X, y).
         
         Update equations:
-        - μ^χⁱ = -E[τ] Σ^χⁱ Σₙ yₙ · J_μ(xₙ)
-        - Σ^χⁱ⁻¹ = -E[τ] Σₙ [J_Σ(xₙ) + J_μ(xₙ) ⊗ J_μ(xₙ)] - diag(Θ)
+        - μ^χⁱ = E[τ] Σ^χⁱ Σₙ yₙ · J_μ(xₙ)
+        - Σ^χⁱ⁻¹ = diag(Θ) + E[τ] Σₙ [J_Σ(xₙ) + J_μ(xₙ) ⊗ J_μ(xₙ)]
         
         where:
         - J_μ(xₙ) = ∂/∂χⁱ μ(xₙ) is the μ-Jacobian (network with block i removed)
@@ -838,21 +902,19 @@ class BayesianMPO:
         J_sigma_permuted = J_sigma_sum.permute(*perm)
         sum_J_sigma = J_sigma_permuted.reshape(d, d)
         
-        # Compute covariance inverse: Σ^⁻¹ = -E[τ] Σₙ [J_Σ(xₙ) + J_μ(xₙ) ⊗ J_μ(xₙ)] - diag(Θ)
-        # Compute without diag first
-        sigma_inv = -E_tau * (sum_J_sigma + J_mu_outer_flat)
+        # Compute covariance inverse: Σ^⁻¹ = diag(Θ) + E[τ] Σₙ [J_Σ(xₙ) + J_μ(xₙ) ⊗ J_μ(xₙ)]
+        # Compute data term first
+        sigma_inv = E_tau * (sum_J_sigma + J_mu_outer_flat)
         
-        # Add diagonal terms: -diag(Θ) and regularization
-        # Avoid creating full diagonal matrix, just subtract from diagonal
-        eps = 1e-6
-        diagonal_correction = theta_flat + eps
-        sigma_inv.diagonal().sub_(diagonal_correction)
+        # Add diagonal terms: diag(Θ)
+        # Avoid creating full diagonal matrix, just add to diagonal
+        sigma_inv.diagonal().add_(theta_flat)
         
         # Compute covariance: Σ = (Σ^⁻¹)^⁻¹
         sigma_cov = torch.inverse(sigma_inv)
         
-        # Compute mean: μ = -E[τ] Σ Σₙ yₙ · J_μ(xₙ)
-        mu_flat = -E_tau * torch.matmul(sigma_cov, sum_y_dot_J_mu_flat)
+        # Compute mean: μ = E[τ] Σ Σₙ yₙ · J_μ(xₙ)
+        mu_flat = E_tau * torch.matmul(sigma_cov, sum_y_dot_J_mu_flat)
         
         # Reshape back to block shape
         mu_new = mu_flat.reshape(mu_shape)
@@ -891,6 +953,85 @@ class BayesianMPO:
             rate=self.tau_beta
         )
 
+    def compute_elbo(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the Evidence Lower Bound (ELBO).
+        
+        ELBO = E_q[log p(y|θ,τ)] + E_q[log p(θ)] + E_q[log p(τ)] - E_q[log q(θ)] - E_q[log q(τ)]
+        
+        Note: E_q[log p(θ)] includes E_q[log p(τ)], so we don't add it separately
+        
+        Args:
+            X: Input data, shape (S, feature_dims)
+            y: Target data, shape (S,)
+            
+        Returns:
+            ELBO value (scalar tensor)
+        """
+        S = X.shape[0]
+        
+        # Forward passes
+        mu_output = self.forward_mu(X, to_tensor=True)  # (S, ...)
+        sigma_output = self.forward_sigma(X, to_tensor=True)  # (S, ...)
+        
+        # Type assertions
+        assert isinstance(mu_output, torch.Tensor)
+        assert isinstance(sigma_output, torch.Tensor)
+        
+        # Flatten to (S,)
+        mu_pred = mu_output.reshape(S, -1).squeeze(-1)  # (S,)
+        sigma_pred = sigma_output.reshape(S, -1).squeeze(-1)  # (S,)
+        
+        # E[τ] and E[log τ]
+        E_tau = self.get_tau_mean()
+        E_log_tau = torch.digamma(self.tau_alpha) - torch.log(self.tau_beta)
+        
+        # Term 1: E_q[log p(y|θ,τ)]
+        # log p(y|θ,τ) = -1/2 * log(2π) + 1/2 * log(τ) - τ/2 * (y - f)²
+        # Taking expectation over q: E_q[(y-f)²] = y² - 2y*E_q[f] + E_q[f²]
+        # where E_q[f²] = Var[f] + E[f]² = Σ(x) + μ(x)²
+        # Therefore: E_q[log p(y|θ,τ)] = -S/2 * log(2π) + S/2 * E[log τ] - E[τ]/2 * Σ[y² - 2y*μ + Σ + μ²]
+        y_squared = y ** 2
+        y_times_mu = y * mu_pred
+        mu_squared = mu_pred ** 2
+        log_likelihood = (
+            -0.5 * S * torch.log(torch.tensor(2 * torch.pi, dtype=X.dtype, device=X.device))
+            + 0.5 * S * E_log_tau
+            - 0.5 * E_tau * (y_squared.sum() - 2.0 * y_times_mu.sum() + sigma_pred.sum() + mu_squared.sum())
+        )
+        
+        # Term 2: E_q[log p(θ)] - prior on blocks, bonds, and τ
+        # NOTE: This already includes E_q[log p(τ)]
+        log_prior_theta = self.compute_expected_log_prior()
+        
+        # Term 3: -E_q[log q(θ)] - entropy of blocks and bonds
+        entropy_theta = torch.tensor(0.0, dtype=X.dtype, device=X.device)
+        
+        # Block entropies (Gaussian)
+        for block_idx in range(len(self.mu_nodes)):
+            sigma_matrix = self._sigma_to_matrix(block_idx)
+            d = sigma_matrix.shape[0]
+            sign, logdet = torch.slogdet(sigma_matrix)
+            entropy_block = 0.5 * (d * (1 + torch.log(torch.tensor(2 * torch.pi, dtype=X.dtype, device=X.device))) + logdet)
+            entropy_theta += entropy_block
+        
+        # Bond entropies (Gamma)
+        for label in self.mu_mpo.distributions.keys():
+            # Get Gamma distributions for this bond
+            gammas = self.mu_mpo.get_gamma_distributions(label)
+            if gammas is not None:
+                for gamma in gammas:
+                    entropy_theta += gamma.entropy()
+        
+        # Term 4: -E_q[log q(τ)] - entropy of τ (Gamma)
+        entropy_tau = self.get_tau_entropy()
+        
+        # ELBO = likelihood + prior + entropy
+        # Note: log_prior_theta already includes E_q[log p(τ)]
+        elbo = log_likelihood + log_prior_theta + entropy_theta + entropy_tau
+        
+        return elbo
+    
     def fit(
         self,
         X: torch.Tensor,
@@ -933,6 +1074,9 @@ class BayesianMPO:
             print('='*70)
             print()
         
+        mse = float('nan')
+        elbo = float('nan')
+        
         for iteration in range(max_iter):
             if verbose:
                 print(f'Iteration {iteration + 1}/{max_iter}')
@@ -963,7 +1107,23 @@ class BayesianMPO:
             if verbose:
                 print(f' ✓ (E[τ] = {tau_mean:.4f})')
             
-            # Step 4: Trim (optional)
+            # Step 4: Compute MSE and ELBO
+            if verbose:
+                print('  Computing metrics...', end='')
+            mu_pred = self.forward_mu(X, to_tensor=True)
+            assert isinstance(mu_pred, torch.Tensor)
+            mse = torch.mean((mu_pred.reshape(-1) - y.reshape(-1)) ** 2).item()
+            
+            try:
+                elbo = self.compute_elbo(X, y).item()
+                if verbose:
+                    print(f' ✓ (MSE = {mse:.4f}, ELBO = {elbo:.2f})')
+            except Exception as e:
+                if verbose:
+                    print(f' ✓ (MSE = {mse:.4f}, ELBO = failed)')
+                elbo = float('nan')
+            
+            # Step 5: Trim (optional)
             if trim_threshold is not None:
                 if verbose:
                     print('  Trimming...', end='')
@@ -973,15 +1133,15 @@ class BayesianMPO:
                 if verbose:
                     print(' ✓')
             
-            # TODO: Compute ELBO for convergence check
-            # For now, just run for max_iter iterations
-            
             if verbose:
                 print()
         
         if verbose:
             print('='*70)
             print('TRAINING COMPLETE')
+            print(f'Final MSE: {mse:.4f}')
+            if not (isinstance(elbo, float) and elbo != elbo):  # Check if not NaN
+                print(f'Final ELBO: {elbo:.2f}')
             print('='*70)
     
     def update_tau_variational(
@@ -996,7 +1156,10 @@ class BayesianMPO:
         
         Update formulas:
         - α_q = α_p + S/2
-        - β_q = β_p + Σ_s[y_s · μ(x_s)] + 1/2 * Σ_s[Σ(x_s)]
+        - β_q = β_p + 1/2 * Σ_s[y_s² - 2*y_s·μ(x_s) + μ(x_s)² + Σ(x_s)]
+        
+        This simplifies from the expected squared residual:
+        E[(y - f)²] = y² - 2y·E[f] + E[f²] = y² - 2y·μ + (μ² + Σ)
         
         where:
         - S is the number of samples
@@ -1018,7 +1181,6 @@ class BayesianMPO:
         # Term 1: β_p (prior)
         beta_q = self.prior_tau_beta.clone()
         
-        # Term 2: Σ_s[y_s · μ(x_s)]
         # Forward pass through μ-MPO for all samples at once
         mu_output_result = self.forward_mu(X, to_tensor=True)  # Returns Tensor when to_tensor=True
         # Type narrowing: when to_tensor=True, result is Tensor
@@ -1026,17 +1188,25 @@ class BayesianMPO:
         mu_flat = mu_output_result.reshape(S, -1)  # (S, output_dim)
         y_flat = y.reshape(S, -1)  # (S, output_dim)
         
-        # Dot product: sum over all samples and output dimensions
-        beta_q = beta_q + torch.sum(y_flat * mu_flat)
-        
-        # Term 3: 1/2 * Σ_s[Σ(x_s)]
         # Forward pass through Σ-MPO for all samples at once
         sigma_output_result = self.forward_sigma(X, to_tensor=True)  # Returns Tensor when to_tensor=True
         # Type narrowing: when to_tensor=True, result is Tensor
         assert isinstance(sigma_output_result, torch.Tensor)
         
-        # Sum over all samples and output dimensions (for scalar output, just sum all)
-        beta_q = beta_q + 0.5 * torch.sum(sigma_output_result)
+        # Squeeze Σ output to remove dummy dimensions and match μ shape
+        sigma_flat = sigma_output_result.reshape(S, -1)  # (S, output_dim)
+        
+        # Compute β_q = β_p + 0.5 * Σ[y² - 2y·μ + μ² + Σ]
+        # This is the expected squared residual: E[(y - f)²] = y² - 2y·μ + E[f²]
+        # where E[f²] = μ² + Σ
+        y_squared = y_flat ** 2
+        y_times_mu = y_flat * mu_flat
+        mu_squared = mu_flat ** 2
+        
+        # Sum all terms with 0.5 factor
+        beta_q = beta_q + 0.5 * torch.sum(
+            y_squared - 2.0 * y_times_mu + mu_squared + sigma_flat
+        )
         
         # Update the parameters
         self.update_tau(alpha=alpha_q, beta=beta_q)
@@ -1143,6 +1313,16 @@ class BayesianMPO:
         for node in self.sigma_nodes:
             self._trim_sigma_node(node, sigma_keep_indices)
         
+        # IMPORTANT: Update prior_bond_params to match trimmed dimensions
+        for label, indices in keep_indices.items():
+            if label in self.prior_bond_params:
+                old_conc = self.prior_bond_params[label]['concentration0']
+                old_rate = self.prior_bond_params[label]['rate0']
+                
+                # Select only the kept indices
+                self.prior_bond_params[label]['concentration0'] = torch.index_select(old_conc, 0, indices)
+                self.prior_bond_params[label]['rate0'] = torch.index_select(old_rate, 0, indices)
+        
         # Reset stacks
         self.sigma_mpo.reset_stacks()
         
@@ -1203,11 +1383,11 @@ class BayesianMPO:
         d = mu_flat.numel()
         
         # Convert Σ block to (d, d) matrix using label-based permutation
+        # Σ-block stores the covariance (variance), not the second moment
         sigma_matrix = self._sigma_to_matrix(block_idx)
         
-        # Compute covariance: Cov = E[W ⊗ W^T] - E[W] ⊗ E[W]^T
-        mu_outer = torch.outer(mu_flat, mu_flat)
-        covariance = sigma_matrix - mu_outer
+        # Σ-block already stores the covariance
+        covariance = sigma_matrix
         
         # Make symmetric to handle numerical errors (floating point precision)
         covariance = 0.5 * (covariance + covariance.T)
@@ -1388,7 +1568,7 @@ class BayesianMPO:
         """
         Compute E_q[log p(Wᵢ)] where p(Wᵢ) ~ N(0, Σ₀).
         
-        Uses the modular expected_log_prob method from MultivariateGaussianDistribution.
+        OPTIMIZED: For isotropic prior Σ₀ = σ₀²I, avoids creating full matrix.
         
         Args:
             block_idx: Index of the block
@@ -1400,16 +1580,53 @@ class BayesianMPO:
         q_block = self.get_block_q_distribution(block_idx)
         
         # Prior mean is 0
-        mu_p = torch.zeros_like(q_block.loc)
+        mu_q = q_block.loc
+        d = mu_q.shape[0]
         
-        # Prior covariance Σ₀
-        sigma_p = self.prior_block_sigma0[block_idx]
+        # Get q's covariance
+        sigma_q = q_block.covariance_matrix
         
-        # Use the modular method
-        return q_block.expected_log_prob(
-            loc_p=mu_p,
-            covariance_matrix_p=sigma_p
-        )
+        # OPTIMIZATION: For isotropic prior Σ₀ = σ₀²I, compute efficiently
+        if self.prior_block_sigma0_isotropic[block_idx]:
+            sigma0_sq = self.prior_block_sigma0_scalar[block_idx]
+            
+            # For Σ_p = σ²I:
+            # - Σ_p⁻¹ = (1/σ²)I
+            # - log|Σ_p| = d * log(σ²)
+            # - tr(Σ_p⁻¹ Σ_q) = (1/σ²) * tr(Σ_q)
+            # - (μ_q - μ_p)ᵀ Σ_p⁻¹ (μ_q - μ_p) = (1/σ²) * ||μ_q||²
+            
+            trace_term = torch.trace(sigma_q) / sigma0_sq
+            mahalanobis_term = torch.sum(mu_q ** 2) / sigma0_sq
+            logdet_sigma_p = d * torch.log(sigma0_sq)
+            
+            result = (-0.5 * d * torch.log(torch.tensor(2 * torch.pi, dtype=mu_q.dtype, device=mu_q.device))
+                     - 0.5 * logdet_sigma_p
+                     - 0.5 * (trace_term + mahalanobis_term))
+            
+            return result
+        else:
+            # Fall back to full matrix computation for non-isotropic priors
+            # (For backward compatibility if prior_block_sigma0 is set manually)
+            if self.prior_block_sigma0 is None:
+                # Build full matrices on demand
+                self.prior_block_sigma0 = []
+                for i, sigma_scalar in enumerate(self.prior_block_sigma0_scalar):
+                    d_i = self.mu_nodes[i].tensor.numel()
+                    if self.prior_block_sigma0_isotropic[i]:
+                        sigma_full = sigma_scalar * torch.eye(d_i, dtype=self.mu_nodes[i].tensor.dtype,
+                                                               device=self.mu_nodes[i].tensor.device)
+                    else:
+                        raise NotImplementedError("Non-isotropic priors not yet supported in optimized code")
+                    self.prior_block_sigma0.append(sigma_full)
+            
+            sigma_p = self.prior_block_sigma0[block_idx]
+            mu_p = torch.zeros_like(mu_q)
+            
+            return q_block.expected_log_prob(
+                loc_p=mu_p,
+                covariance_matrix_p=sigma_p
+            )
     
     def _expected_log_prior_modes(self) -> torch.Tensor:
         """
