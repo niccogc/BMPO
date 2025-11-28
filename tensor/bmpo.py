@@ -290,7 +290,7 @@ class BMPONetwork(TensorNetwork):
             
             theta = torch.einsum(einsum_str, *factors)
             
-        return theta * 0.5
+        return theta
     
     def compute_entropy(self, label: str) -> Union[torch.Tensor, None]:
         """

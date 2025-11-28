@@ -58,9 +58,9 @@ print(f"z range: [{z_train.min():.2f}, {z_train.max():.2f}]")
 print()
 
 # Create Bayesian MPO with 5 blocks, rank=6, small trimming
-print("Creating Bayesian MPO (4 blocks, rank=6, NO trimming)...")
+print("Creating Bayesian MPO (3 blocks, rank=6, NO trimming)...")
 bmpo = create_bayesian_tensor_train(
-    num_blocks=4,
+    num_blocks=3,
     bond_dim=6,
     input_features=3,  # [1, x, y]
     output_shape=1,
@@ -93,7 +93,7 @@ print()
 
 max_iter = 40
 mse_history = []
-rank_history = {f'r{i}': [] for i in range(1, 4)}
+rank_history = {f'r{i}': [] for i in range(1, 3)}
 
 for iteration in range(max_iter):
     # Update blocks
@@ -140,7 +140,7 @@ for i, node in enumerate(bmpo.mu_nodes):
 print()
 
 print("Final bond ranks:")
-for i in range(1, 3):
+for i in range(1, 4):
     label = f'r{i}'
     rank = rank_history[label][-1]
     initial_rank = rank_history[label][0]
@@ -291,7 +291,7 @@ fig2, axes = plt.subplots(1, 2, figsize=(14, 5))
 
 # Plot rank evolution
 ax_ranks = axes[0]
-for i in range(1, 3):
+for i in range(1, 4):
     label = f'r{i}'
     ax_ranks.plot(iterations, rank_history[label], marker='o', linewidth=2, 
                  markersize=4, label=label)

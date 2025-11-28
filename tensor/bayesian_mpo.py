@@ -954,6 +954,10 @@ class BayesianMPO:
         )
 
     def compute_elbo(self, X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # TODO: WARNING: Elbo diverges to - inf.
+        # We need to debug this, in such a way:
+        # -find where it explodes. (Also it should increase stadily.)
+        # -slowly go back from the return printing all the values to pinpoint exactly which part of the computation is causing the issue!
         """
         Compute the Evidence Lower Bound (ELBO).
         
@@ -991,6 +995,7 @@ class BayesianMPO:
         # Taking expectation over q: E_q[(y-f)²] = y² - 2y*E_q[f] + E_q[f²]
         # where E_q[f²] = Var[f] + E[f]² = Σ(x) + μ(x)²
         # Therefore: E_q[log p(y|θ,τ)] = -S/2 * log(2π) + S/2 * E[log τ] - E[τ]/2 * Σ[y² - 2y*μ + Σ + μ²]
+        # TODO: isnt this already computed in the rate update of tau? is it needed to be recomputed? since we compute elbo after tau ate update cant we just use that?
         y_squared = y ** 2
         y_times_mu = y * mu_pred
         mu_squared = mu_pred ** 2
@@ -1008,6 +1013,7 @@ class BayesianMPO:
         entropy_theta = torch.tensor(0.0, dtype=X.dtype, device=X.device)
         
         # Block entropies (Gaussian)
+        # TODO: isnt already a method for the class of gaussian? using the q distribution definition for the block? simply passing the mu block and sigma block? check for it and if ti works the same!
         for block_idx in range(len(self.mu_nodes)):
             sigma_matrix = self._sigma_to_matrix(block_idx)
             d = sigma_matrix.shape[0]
@@ -1016,6 +1022,7 @@ class BayesianMPO:
             entropy_theta += entropy_block
         
         # Bond entropies (Gamma)
+        # TODO: isnt implemented a product probability to do this iteration under the hood? cant it be applied to this? shouldnt that be defined at the start or is it too complicated?
         for label in self.mu_mpo.distributions.keys():
             # Get Gamma distributions for this bond
             gammas = self.mu_mpo.get_gamma_distributions(label)
@@ -1073,7 +1080,7 @@ class BayesianMPO:
                 print(f'Trim threshold: {trim_threshold}')
             print('='*70)
             print()
-        
+        # TODO: track also the r2
         mse = float('nan')
         elbo = float('nan')
         
@@ -1314,6 +1321,7 @@ class BayesianMPO:
             self._trim_sigma_node(node, sigma_keep_indices)
         
         # IMPORTANT: Update prior_bond_params to match trimmed dimensions
+        # TODO: I dont get here, the prior paramaters stay the same in value, we just remove the trimmed one, is that what you are doing?
         for label, indices in keep_indices.items():
             if label in self.prior_bond_params:
                 old_conc = self.prior_bond_params[label]['concentration0']
@@ -1380,8 +1388,7 @@ class BayesianMPO:
         
         # Flatten μ block: E_q[W_i]
         mu_flat = mu_node.tensor.flatten()
-        d = mu_flat.numel()
-        
+      
         # Convert Σ block to (d, d) matrix using label-based permutation
         # Σ-block stores the covariance (variance), not the second moment
         sigma_matrix = self._sigma_to_matrix(block_idx)
@@ -1390,6 +1397,8 @@ class BayesianMPO:
         covariance = sigma_matrix
         
         # Make symmetric to handle numerical errors (floating point precision)
+        # TODO: EXPENSIVE:
+        # This is expensive, it should naturally be symmetric is it necessary to do this? Check before and after if there is any changes
         covariance = 0.5 * (covariance + covariance.T)
         
         return MultivariateGaussianDistribution(
@@ -1590,11 +1599,11 @@ class BayesianMPO:
         if self.prior_block_sigma0_isotropic[block_idx]:
             sigma0_sq = self.prior_block_sigma0_scalar[block_idx]
             
-            # For Σ_p = σ²I:
-            # - Σ_p⁻¹ = (1/σ²)I
-            # - log|Σ_p| = d * log(σ²)
-            # - tr(Σ_p⁻¹ Σ_q) = (1/σ²) * tr(Σ_q)
-            # - (μ_q - μ_p)ᵀ Σ_p⁻¹ (μ_q - μ_p) = (1/σ²) * ||μ_q||²
+            # TODO: WARNING: this equation is wrong!
+            # 
+            # E_q[log p] = - d*0.5*log 2 \pi + 0.5 * log | \sigma_p^-1| - 0.5 * trace((\sigma_q + \mu_q \outer \mu_q)\sigma_p^-1)
+            # Implement this, and indeed keep into account that \sigma_p is isotropic, but actually it could also be different, but still diagonal.
+            # check if it is already implemented like this or equivalent
             
             trace_term = torch.trace(sigma_q) / sigma0_sq
             mahalanobis_term = torch.sum(mu_q ** 2) / sigma0_sq
