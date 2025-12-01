@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tensor.bayesian_mpo_builder import create_bayesian_tensor_train
 
-torch.manual_seed(42)
+torch.manual_seed(293847)
 
 print("="*70)
 print("BAYESIAN MPO POLYNOMIAL PREDICTION (RANK=3, NO TRIMMING)")
@@ -31,7 +31,7 @@ print(f"True polynomial: y = {a_true}*x³ + {b_true}*x² + {c_true}")
 print()
 
 # Generate training data
-S_train = 100
+S_train = 1000
 x_train = torch.rand(S_train, dtype=torch.float64) * 2 - 1  # Uniform(-1, 1)
 y_train = a_true * x_train**3 + b_true * x_train**2 + c_true
 noise_std = 0.1
@@ -48,7 +48,7 @@ print()
 print("Creating Bayesian MPO (rank=3, no trimming)...")
 bmpo = create_bayesian_tensor_train(
     num_blocks=3,
-    bond_dim=3,
+    bond_dim=4,
     input_features=2,
     output_shape=1,
     constrict_bond=False,
@@ -267,7 +267,7 @@ ax5.legend(fontsize=10)
 ax5.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('bayesian_predictions_rank3.png', dpi=150, bbox_inches='tight')
+plt.savefig('ciao_bayesian_predictions_rank3.png', dpi=150, bbox_inches='tight')
 print("Plot saved to: bayesian_predictions_rank3.png")
 print()
 

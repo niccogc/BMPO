@@ -45,7 +45,7 @@ print()
 print("Creating Bayesian MPO with random priors...")
 bmpo = create_bayesian_tensor_train(
     num_blocks=3,
-    bond_dim=8,
+    bond_dim=6,
     input_features=2,  # [1, x]
     output_shape=1,
     constrict_bond=False,

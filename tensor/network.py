@@ -255,22 +255,39 @@ class TensorNetwork:
             'coeff_ein': coeff_ein,
         }
 
-    def get_b(self, node, grad):
+    def get_b(self, node, grad=None, is_sigma=False, output_shape=None):
+        """
+        Compute b term: Jacobian contracted with gradient.
+        
+        Args:
+            node: The node to compute Jacobian for
+            grad: Gradient tensor (required if is_sigma=False)
+            is_sigma: If True, compute sum of Jacobian (optimized for Σ-MPO where grad=ones)
+            output_shape: Shape for expand_labels (required if is_sigma=True)
+        
+        Returns:
+            Contracted Jacobian tensor
+        """
         # Determine broadcast
         broadcast_dims = tuple(d for d in self.output_labels if d not in node.dim_labels)
         non_broadcast_dims = tuple(d for d in self.output_labels if d != self.sample_dim)
 
         # Compute the Jacobian
-        J = self.compute_jacobian_stack(node).copy().expand_labels(self.output_labels, grad.shape).permute_first(*broadcast_dims)
+        J = self.compute_jacobian_stack(node).copy()
+        
+        if not is_sigma:
+            J = J.expand_labels(self.output_labels, grad.shape).permute_first(*broadcast_dims)
+        else:
+            # For sigma, we need the output shape to expand labels correctly
+            J = J.expand_labels(self.output_labels, output_shape).permute_first(*broadcast_dims)
 
         # Assign unique einsum labels
         import string
         all_letters = iter(string.ascii_letters)
-        dim_labels = {dim: next(all_letters) for dim in self.output_labels}  # Assign letters to output dims
+        dim_labels = {dim: next(all_letters) for dim in self.output_labels}
         for d in non_broadcast_dims:
             dim_labels['_' + d] = next(all_letters)
 
-        d_loss_ein = ''.join(dim_labels[d] for d in self.output_labels)
         J_ein1 = ''
         J_out1 = []
         dim_order = []
@@ -283,11 +300,17 @@ class TensorNetwork:
                 J_out1.append(dim_labels[d])
                 dim_order.append(d)
         J_out1 = ''.join([J_out1[dim_order.index(d)] for d in node.dim_labels])
-        einsum_b = f"{J_ein1},{d_loss_ein}->{J_out1}"
 
-        # Compute einsum operations
-        b = torch.einsum(einsum_b, J.tensor, grad)
-
+        if is_sigma:
+            # Optimized path: just sum over contracted dimensions (no grad multiplication)
+            einsum_b = f"{J_ein1}->{J_out1}"
+            b = torch.einsum(einsum_b, J.tensor)
+        else:
+            # Standard path: contract with grad
+            d_loss_ein = ''.join(dim_labels[d] for d in self.output_labels)
+            einsum_b = f"{J_ein1},{d_loss_ein}->{J_out1}"
+            b = torch.einsum(einsum_b, J.tensor, grad)
+        
         return b
 
     def solve_system(self, node, A, b, method='exact', eps=0.0):

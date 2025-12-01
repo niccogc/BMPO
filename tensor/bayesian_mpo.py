@@ -90,7 +90,7 @@ class BayesianMPO:
     
     def _create_sigma_nodes(self) -> List[TensorNode]:
         """
-        Create Σ-MPO nodes from μ-MPO nodes.
+        Create Σ-MPO nodes.
         
         Each μ-node with shape (d1, d2, d3) and labels ['r1', 'f1', 'r2']
         becomes a Σ-node with shape (d1, d1, d2, d2, d3, d3) 
@@ -155,19 +155,34 @@ class BayesianMPO:
         This corresponds to setting the Σ-node such that when reshaped:
         E[W ⊗ W^T] = μ ⊗ μ^T + σ²I
         
+        IMPORTANT: Scale by number of blocks AND rank dimensions to prevent exponential growth.
+        With N blocks and rank dimensions R, we scale: initial_variance = 1.0 / (N * R_avg)
+        
         Args:
             sigma_nodes: List of Σ-MPO nodes to initialize
         """
+        num_blocks = len(sigma_nodes)
+        
         for mu_node, sigma_node in zip(self.mu_nodes, sigma_nodes):
             # Get μ block (flattened)
-            mu_flat = mu_node.tensor.flatten()
-            d = mu_flat.numel()
+            d = mu_node.tensor.flatten().numel()
             
-            # Compute μ ⊗ μ^T + σ²I
-            # Using σ² = 1.0 as default initial variance
-            initial_variance = 1.0
-            mu_outer = torch.outer(mu_flat, mu_flat)
-            sigma_matrix = mu_outer + initial_variance * torch.eye(d, dtype=mu_flat.dtype, device=mu_flat.device)
+            # Compute average rank dimension for this block
+            # rank_labels are the bond dimensions (e.g., 'r0', 'r1', 'r2')
+            rank_dims = []
+            for label, size in zip(mu_node.dim_labels, mu_node.shape):
+                if label in self.mu_mpo.rank_labels:
+                    rank_dims.append(size)
+            
+            # Average rank dimension (geometric mean to handle varying sizes)
+            if rank_dims:
+                avg_rank = torch.tensor(rank_dims, dtype=torch.float64).prod().pow(1.0 / len(rank_dims)).item()
+            else:
+                avg_rank = 1.0  # Fallback if no rank dimensions
+            
+            # Scale by both number of blocks and rank dimension
+            initial_variance = 1.0 / (num_blocks * avg_rank)
+            sigma_matrix = initial_variance * torch.eye(d, dtype=mu_node.tensor.dtype, device=mu_node.tensor.device)
             
             # Reshape sigma_matrix (d, d) back to Σ-node shape
             # Σ-node has shape (d1, d1, d2, d2, ...) where d = d1 * d2 * ...
@@ -808,6 +823,74 @@ class BayesianMPO:
         
         return result
     
+    def _solve_variational_system_inverse(
+        self, 
+        sigma_inv: torch.Tensor, 
+        rhs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Solve variational system using torch.inverse (original method).
+        
+        Args:
+            sigma_inv: Precision matrix Σ^⁻¹, shape (d, d)
+            rhs: Right-hand side E[τ] * Σₙ yₙ · J_μ, shape (d,)
+            
+        Returns:
+            sigma_cov: Covariance matrix Σ, shape (d, d)
+            mu_flat: Mean vector μ, shape (d,)
+        """
+        sigma_cov = torch.inverse(sigma_inv)
+        mu_flat = torch.matmul(sigma_cov, rhs)
+        return sigma_cov, mu_flat
+    
+    def _solve_variational_system_cholesky(
+        self, 
+        sigma_inv: torch.Tensor, 
+        rhs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Solve variational system using Cholesky decomposition (stable method).
+        
+        Args:
+            sigma_inv: Precision matrix Σ^⁻¹, shape (d, d)
+            rhs: Right-hand side E[τ] * Σₙ yₙ · J_μ, shape (d,)
+            
+        Returns:
+            sigma_cov: Covariance matrix Σ, shape (d, d)
+            mu_flat: Mean vector μ, shape (d,)
+        """
+        L = torch.linalg.cholesky(sigma_inv)
+        sigma_cov = torch.cholesky_inverse(L)
+        mu_flat = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)
+        return sigma_cov, mu_flat
+    
+    def _solve_variational_system(
+        self, 
+        sigma_inv: torch.Tensor, 
+        rhs: torch.Tensor,
+        method: str = 'inverse'
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Solve variational system: Σ^⁻¹ μ = rhs, and compute Σ = (Σ^⁻¹)^⁻¹.
+        
+        Args:
+            sigma_inv: Precision matrix Σ^⁻¹, shape (d, d)
+            rhs: Right-hand side E[τ] * Σₙ yₙ · J_μ, shape (d,)
+            method: 'inverse' or 'cholesky'
+            
+        Returns:
+            sigma_cov: Covariance matrix Σ, shape (d, d)
+            mu_flat: Mean vector μ, shape (d,)
+        """
+        if method == 'cholesky':
+            try:
+                return self._solve_variational_system_cholesky(sigma_inv, rhs)
+            except RuntimeError:
+                # Fallback to inverse if Cholesky fails
+                return self._solve_variational_system_inverse(sigma_inv, rhs)
+        else:
+            return self._solve_variational_system_inverse(sigma_inv, rhs)
+
     def update_block_variational(
         self, 
         block_idx: int, 
@@ -882,20 +965,13 @@ class BayesianMPO:
         sigma_output = self.forward_sigma(X, to_tensor=False)
         self.sigma_mpo.output_labels = tuple(sigma_output.dim_labels)
         
-        # Create y_sigma matching sigma output shape (all ones to get Jacobian sum)
-        y_sigma = torch.ones(sigma_output.shape, dtype=mu_node.tensor.dtype, device=mu_node.tensor.device)
-        
-        # Get J_Σ term using get_b - returns tensor with Σ-node shape
-        J_sigma_sum = self.sigma_mpo.get_b(sigma_node, y_sigma)
+        # Get J_Σ term using optimized get_b with is_sigma flag
+        # This avoids creating a tensor of ones and doing unnecessary einsum
+        J_sigma_sum = self.sigma_mpo.get_b(sigma_node, grad=None, is_sigma=True, output_shape=sigma_output.shape)
         
         # Convert J_Σ from Σ-block shape to (d, d) matrix using existing method
         # J_sigma_sum has shape like (d1o, d1i, d2o, d2i, ...)
         # We need to reshape it to (d, d) where d = d1*d2*...
-        # Use the same logic as _sigma_to_matrix but for the Jacobian
-        sigma_matrix = self._sigma_to_matrix(block_idx)  # Get current Σ as (d, d)
-        # J_sigma_sum should have same structure, reshape it the same way
-        # Actually J_sigma_sum already has the right shape, just need to flatten properly
-        
         # Get permutation to convert to matrix form
         outer_indices, inner_indices = self._get_sigma_to_mu_permutation(block_idx)
         perm = outer_indices + inner_indices
@@ -910,11 +986,9 @@ class BayesianMPO:
         # Avoid creating full diagonal matrix, just add to diagonal
         sigma_inv.diagonal().add_(theta_flat)
         
-        # Compute covariance: Σ = (Σ^⁻¹)^⁻¹
-        sigma_cov = torch.inverse(sigma_inv)
-        
-        # Compute mean: μ = E[τ] Σ Σₙ yₙ · J_μ(xₙ)
-        mu_flat = E_tau * torch.matmul(sigma_cov, sum_y_dot_J_mu_flat)
+        # Compute covariance and mean
+        rhs = E_tau * sum_y_dot_J_mu_flat
+        sigma_cov, mu_flat = self._solve_variational_system(sigma_inv, rhs)
         
         # Reshape back to block shape
         mu_new = mu_flat.reshape(mu_shape)
@@ -1321,7 +1395,6 @@ class BayesianMPO:
             self._trim_sigma_node(node, sigma_keep_indices)
         
         # IMPORTANT: Update prior_bond_params to match trimmed dimensions
-        # TODO: I dont get here, the prior paramaters stay the same in value, we just remove the trimmed one, is that what you are doing?
         for label, indices in keep_indices.items():
             if label in self.prior_bond_params:
                 old_conc = self.prior_bond_params[label]['concentration0']
