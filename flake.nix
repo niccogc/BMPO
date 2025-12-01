@@ -28,6 +28,7 @@
         jedi-language-server
         scipy
         matplotlib
+        scikit-learn
         # jax
         # quimb
       ]);

@@ -277,10 +277,10 @@ class BMPONetwork(TensorNetwork):
         
         if num_dims == 0:
             # Edge case: no dimensions
-            return torch.tensor(0.5, dtype=node.tensor.dtype, device=node.tensor.device)
+            return torch.tensor(1, dtype=node.tensor.dtype, device=node.tensor.device)
         elif num_dims == 1:
             # Single dimension: just scale
-            return factors[0].unsqueeze(0) * 0.5 if factors[0].numel() == 1 else factors[0] * 0.5
+            return factors[0].unsqueeze(0) if factors[0].numel() == 1 else factors[0]
         else:
             # Multiple dimensions: use einsum
             # Create symbolic indices for each dimension

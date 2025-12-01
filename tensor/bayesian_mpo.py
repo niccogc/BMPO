@@ -7,7 +7,10 @@ Contains:
 - Prior distributions: Gamma distributions for each mode of μ-MPO
 - τ distribution: Gamma(α, β) for noise/regularization
 """
-
+# TODO: Truncation Criteria:
+# we retain all mode components for the first three iterations to allow the model enough flexibility before removing potentially useful components. After that, we remove components that contribute less than An arbitrary treshold to the total variance. To identify low variance component we can just look at the diagonal value of the sigma block and remove components whose diagonal values fall below the variance threshold. 
+# 
+# TODO: Sigma initialization should depend on all modes not only on the ranks.
 import torch
 from tensor.node import TensorNode
 from tensor.network import TensorNetwork
@@ -653,7 +656,8 @@ class BayesianMPO:
             # Shape: (bond_size,)
             
             # ADD to rate_q
-            rate_q = rate_q + partial_trace
+            # NOTE: Added the 0.5*, will it work?
+            rate_q = rate_q + 0.5*partial_trace
         
         # Update the bond parameters
         self.update_mu_params(label, concentration=concentration_q, rate=rate_q)
@@ -861,6 +865,7 @@ class BayesianMPO:
         """
         L = torch.linalg.cholesky(sigma_inv)
         sigma_cov = torch.cholesky_inverse(L)
+        # TODO: Is this cholesky solve doing the same as mu_flat = torch.matmul(sigma_cov, rhs)? matmul is correct, and if they are doing the same, why prefering cholesky solve?
         mu_flat = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)
         return sigma_cov, mu_flat
     
