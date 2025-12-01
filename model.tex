@@ -1,0 +1,145 @@
+# Generic Bayesian TN with correct formulas!
+
+We can generalize all of this considering any tensor networks.
+
+Very trivially a tensor networks is defined by its nodes and bonds.
+
+Nodes will be indicated with $A^i$.
+
+We assume now that the full contraction of all nodes in the tensor networks, will be a tensor $\bm{A}$, where the free modes (uncontracted) can be categorized as input and output modes. (Is it important to assume that output mode can be only one? or works for any number of output modes with the same formaism?)
+
+We can use Bayesian Variational Inference with moment matching (Is it possible with non squared loss? should we develop a theory for non generic exponential likelihoods? It is hard because probably the distribution of the blocks also should reflect the likelihood distribution).
+
+The main component are, likelihood $L$, probability distribution of the block, probability distribution of the bonds.
+
+So given a node $A^i$, we will say $P_i \quad Q_i$ are respectively the prior and (approximated posterior?) of node $i$.
+And $p_{i} \quad q_{i}$ are the prior and (approximated posterior?) of bond $i$.
+
+simply the $p$ and $q$ distribution will be written as:
+
+\begin{equation}
+\begin{aligned}
+	& p = L \prod_{i\in nodes} P_i \prod_{j\in bonds} p_j \\
+	& q = \prod_{i\in nodes} Q_i \prod_{j\in bonds} q_j\\
+\end{aligned}
+\label{eq:pandq}
+\end{equation}
+
+Now, probably this can all be formalized for and $L, P, Q$ conjugate distributions that belong to an exponential family (maybe, but maybe not worth the effort), and any conjugate between $p,q$
+
+In this example we consider $L, P, Q$ to be gaussian densities. And $p,q$ to be Gamma distribution.
+
+For the likelihood we also add a $\tau^{-1}$ parameter as variance of the likelihood.
+
+Now, the tensor networks that we should construct are the $\bm{\mu}$ and $\bm{\Sigma}$ tensor network.
+
+$\mu$ network is a network defined exactly as the original $\bm{A}$ tensor network, and it will represent the mean value of a node.
+
+$\sigma$ network is a network with the same topology as $\bm{A}$, but the tensors (and consequently the bonds) will have squared dimension.
+It represents the covariance of the node.
+
+To be more explicit
+
+\begin{equation}
+\begin{aligned}
+	& \mu^i =  \E[A^i]\\
+	& \Sigma^i = \E[A^i\otimes A^i] - \mu^i\otimes\mu^i\\
+\end{aligned}
+\label{eq:musigmablock}
+\end{equation}
+
+Are the mean and covarance of the $Q_i$ distributions.
+
+We define indicate that the bond $i$ is contracting a mode of tensor $A^j$ as, $i \in A^j$.
+We define the set of bonds associated to a node $i$ as $B(i) = \{j | j \in edges \land j \in A^i\}$
+We will define the set of nodes belonging to bond $i$ as $A(i) = \{ A^j | A^j \in nodes \land i \in B(j)\}$
+The notation is a bit recursive, but the relation is between nodes and bonds is symmetric.
+
+This will be useful to write the update rules.
+
+Now the update rules needed are for the $\mu$ and $\sigma$ blocks, and the parameters of the gamma distribution of $q$, the bond parameters (each dimension in a mode is associated to  gamma distribution)
+
+So for an edge $q_i(j) = Ga(\lambda_{ij}|\alpha_{ij},\beta_{ij})$.
+
+meaning that it is the probability distribution of edge $i$, dimension $j$.
+
+We indicate as $\theta^{B(i)}_{jk\dots}$ the product of the expectation values which is gamma distributed for the bonds in $B(i)$ for dimensions $jk\dots$.
+More explicitly
+
+\begin{equation}
+	\theta^{B(i)}_{jk\dots} = \E[\lambda_{aj}]\E[\lambda_{bk}]\dots \quad for\quad a,b,\dots \in B(i)
+\label{eq:theta}
+\end{equation}
+
+or
+
+\begin{equation}
+	\theta^{B(i)} = \bigotimes_{b\in B(i)}\E[\vec{\lambda}_{b}]
+\label{eq:thetabetta?}
+\end{equation}
+
+Practically, given a block $i$, theta will be a tensor containing all the expectations of all its modes for all dimensions.
+(The dimension of this tensor is indeed the same as the one of the nodes).
+
+To note, if we want the same but without a specific edge considered it will be naturally denoted as
+
+\begin{equation}
+	\theta^{B(i)/z}_{jk\dots} = \E[\lambda_{aj}]\E[\lambda_{bk}]\dots \quad for\quad a,b,\dots \in B(i)/z
+\label{eq:thetanot}
+\end{equation}
+
+where trivially the set $B(i)/z$ is the set of bonds of node $i$ without the bond $z$.
+When we will indicate as $\bm{\theta}^{B(i)}$ it means that is a diagonal matrix with ${\theta}^{B(i)}$ as diagonal elements.
+
+Lastly we will define the derivative over a node for the tensor network (which can be seen as a projection operator), and can be hence indicated as $T$.
+
+\begin{equation}
+	T_i \bm{A} = \frac{\partial}{\partial A^i} \bm{A}
+\label{eq:projection}
+\end{equation}
+
+which trivially is the same network without the node $A^i$.
+
+We define as such the updates of the $\Sigma$ and $\mu$ network.
+
+\begin{equation}
+\begin{aligned}
+	& {\hat{\Sigma^{i}}}^{-1} = \E[\tau] \left(\sum_n T_i \bm{\Sigma}(x_n\otimes x_n) + \sum_n T_i\bm{\mu}x_n\otimes T_i\bm{\mu}x_n\right) + \bm{\theta}^{B(i)}\\
+	& {\hat{\mu^{i}}} = \E[\tau]{\hat{\Sigma^{i}}} \sum_n y_n T_i\bm{\mu}x_n\\
+\end{aligned}
+\label{eq:sigmuupdate}
+\end{equation}
+
+The updates of the edges parameters can be found as the following:
+
+\begin{equation}
+\begin{aligned}
+	&  \alpha_{ij} = \alpha_{ij}^0 + \frac{|A(i)|\dim(i)}{2}\\
+	& \beta_{ij} = \beta_{ij}^0 + \frac{1}{2}\sum_{a \in A(i)}tr_{B(a)/i}\left[\left(\Sigma^a + \mu^a\otimes\mu^a\right)\bm{\theta}^{B(a)/i}\right]_j\\
+\end{aligned}
+\label{eq:gammabond}
+\end{equation}
+
+or even better vectorized for all dimension of the mode $i$.
+
+\begin{equation}
+\begin{aligned}
+	&  \vec{\alpha}_{ij} = \vec{\alpha}_{i}^0 + \frac{|A(i)|\dim(i)}{2}\\
+	& \vec{\beta}_{i} = \vec{\beta}_{i}^0 + \frac{1}{2}\sum_{a \in A(i)}tr_{B(a)/i}\left[\left(\Sigma^a + \mu^a\otimes\mu^a\right)\bm{\theta}^{B(a)/i}\right]\\
+\end{aligned}
+\label{eq:gammabondvec}
+\end{equation}
+
+simply note that $\alpha^0$ and $\beta^0$ are the prior parameters, $|\cdot|$ is the dimension of a set (in out case $|A(i)|$ is the number of nodes that share the bond $i$), and $\dim(i)$ is the dimension of the bond. And $tr_{B(a)/i}$ is the partial trace over the edges in $B(a)$ excluded $i$.
+
+ Lastly the update equation for tau.
+
+\begin{equation}
+\begin{aligned}
+	& \alpha = \alpha^0+\frac{S}{2}\\
+	& \beta = \beta^0-\|\bm{y}\|^{2}+\bm{y}\cdot\bm{\mu x} + \frac{1}{2}\sum_n \bm{\Sigma}(x_n\otimes x_n)+\bm{\mu}x_n\otimes\bm{\mu}x_n
+\end{aligned}
+\label{eq:alhabeta2}
+\end{equation}
+
+To add multiple output I am $95\%$ sure that it is enough to sum over the classes outputs additionally than the samples.
