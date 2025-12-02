@@ -13,9 +13,14 @@ from tensor.bayesian_tn import BayesianTensorNetwork
 
 def create_simple_mps():
     """
-    Create a simple 2-block MPS: Input -> A -> B -> Output
+    Create a simple 2-block MPS with PARAMETERS ONLY (no inputs in TN).
     
-    This mimics the structure in visualize_predictions_standardized.py
+    NEW STRUCTURE (tn4ml style):
+    - Only parameter nodes A and B are in the TensorNetwork
+    - Inputs are handled separately and combined during forward pass
+    - A contracts with input on 'x' index
+    - A and B contract on 'r1' index
+    - Both A and B have 'out' index for output
     """
     # Dimensions
     d_in = 2      # Input features (1, x) for polynomial
@@ -26,22 +31,25 @@ def create_simple_mps():
     np.random.seed(42)
     torch.manual_seed(42)
     
-    # Input node: (batch, features)
-    # We'll set this during training
-    input_data = np.ones((1, d_in))  # Dummy, will be replaced
-    input_tensor = qtn.Tensor(data=input_data, inds=('batch', 'x'), tags='input')  # type: ignore
+    # PARAMETERS ONLY (NO input nodes!)
     
-    # Block A: (x, r1, batch_out) - connects input and outputs to B
+    # Block A: (x, r1, out) - contracts with input on 'x', with B on 'r1'
     A_data = np.random.randn(d_in, r1, d_out) * 0.1
-    A_tensor = qtn.Tensor(data=A_data, inds=('x', 'r1', 'batch_out'), tags='A')  # type: ignore
+    A_tensor = qtn.Tensor(data=A_data, inds=('x', 'r1', 'out'), tags='A')  # type: ignore
     
-    # Block B: (r1, batch_out) - final contraction
+    # Block B: (r1, out) - contracts with A on 'r1', both output to 'out'
     B_data = np.random.randn(r1, d_out) * 0.1
-    B_tensor = qtn.Tensor(data=B_data, inds=('r1', 'batch_out2'), tags='B')  # type: ignore
+    B_tensor = qtn.Tensor(data=B_data, inds=('r1', 'out'), tags='B')  # type: ignore
     
-    tn = qtn.TensorNetwork([input_tensor, A_tensor, B_tensor])
+    # Create TensorNetwork with ONLY parameters
+    param_tn = qtn.TensorNetwork([A_tensor, B_tensor])
     
-    return tn
+    # Define which indices the inputs contract with
+    input_indices = {
+        'features': ['x']  # Input data contracts on 'x' index
+    }
+    
+    return param_tn, input_indices
 
 
 def test_simple_regression():
@@ -65,14 +73,14 @@ def test_simple_regression():
     print(f"  y shape: {y.shape}")
     print(f"  y range: [{y.min():.3f}, {y.max():.3f}]")
     
-    # Create network
+    # Create network (NEW STRUCTURE)
     print("\nCreating network...")
-    tn = create_simple_mps()
+    param_tn, input_indices = create_simple_mps()
     
     btn = BayesianTensorNetwork(
-        mu_tn=tn.copy(),
+        param_tn=param_tn.copy(),
+        input_indices=input_indices,
         learnable_tags=['A', 'B'],
-        input_tags=['input'],
         tau_alpha=torch.tensor(2.0, dtype=torch.float64),
         tau_beta=torch.tensor(1.0, dtype=torch.float64),
         device=torch.device('cpu'),
@@ -80,25 +88,20 @@ def test_simple_regression():
     )
     
     print(f"  Learnable nodes: {btn.learnable_tags}")
-    print(f"  Input nodes: {btn.input_tags}")
+    print(f"  Input indices: {btn.input_indices}")
     print(f"  Bonds: {btn.mu_network.bond_labels}")
     print(f"  Initial E[τ]: {btn.get_tau_mean().item():.4f}")
     
-    # Prepare inputs dict
+    # Prepare inputs dict (NEW: map to input names, not tags)
     inputs_dict = {
-        'input': X
+        'features': X  # Maps to 'features' which contracts on 'x' index
     }
     
     # Test initial forward pass
     print("\nTesting initial forward pass...")
     try:
-        y_pred_init = []
-        for i in range(num_samples):
-            sample_input = {'input': X[i:i+1]}
-            y_i = btn.forward_mu(sample_input)
-            y_pred_init.append(y_i.item() if y_i.numel() == 1 else y_i.squeeze().item())
-        
-        y_pred_init = torch.tensor(y_pred_init, dtype=torch.float64)
+        # NEW: Use batch forward (handles internally)
+        y_pred_init = btn.forward_mu(inputs_dict)
         mse_init = ((y_pred_init - y)**2).mean().item()
         print(f"  Initial MSE: {mse_init:.6f}")
     except Exception as e:

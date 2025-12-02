@@ -32,8 +32,9 @@ class BayesianTensorNetwork:
     def __init__(
         self,
         mu_tn: qtn.TensorNetwork,
+        sigma_tn: qtn.TensorNetwork,
+        input_indices: Dict[str, List[str]],
         learnable_tags: List[str],
-        input_tags: Optional[List[str]] = None,
         tau_alpha: Optional[torch.Tensor] = None,
         tau_beta: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
@@ -42,34 +43,66 @@ class BayesianTensorNetwork:
         """
         Initialize Bayesian Tensor Network.
         
+        Generic constructor - works with ANY tensor network topology!
+        The builder/structure comes from outside.
+        
         Args:
-            mu_tn: Quimb TensorNetwork for the mean (μ) network
+            mu_tn: Mean tensor network (parameters only, no inputs)
+            sigma_tn: Covariance tensor network (doubled indices, no inputs)
+                     Use bayesian_tn_builder.create_sigma_network() to create from mu_tn
+            input_indices: Dict mapping input names to indices they contract with
+                          e.g., {'features': ['p1', 'p2', 'p3']} for polynomial MPO
             learnable_tags: List of tensor tags that are learnable
-            input_tags: List of tensor tags that are inputs (fixed)
-            tau_alpha: Initial alpha for τ ~ Gamma(α, β) (noise precision)
-            tau_beta: Initial beta for τ ~ Gamma(α, β)
+            tau_alpha: Initial α for τ ~ Gamma(α, β) (noise precision)
+            tau_beta: Initial β for τ ~ Gamma(α, β)
             device: PyTorch device
             dtype: PyTorch dtype
+            
+        Example:
+            >>> import quimb.tensor as qtn
+            >>> from tensor.bayesian_tn_builder import create_sigma_network
+            >>> 
+            >>> # Create mu network (any structure!)
+            >>> A = qtn.Tensor(data=..., inds=('x', 'r1'), tags='A')
+            >>> B = qtn.Tensor(data=..., inds=('r1', 'y'), tags='B')
+            >>> mu_tn = qtn.TensorNetwork([A, B])
+            >>> 
+            >>> # Create sigma network
+            >>> sigma_tn = create_sigma_network(mu_tn, ['A', 'B'])
+            >>> 
+            >>> # Create Bayesian TN
+            >>> btn = BayesianTensorNetwork(
+            >>>     mu_tn=mu_tn,
+            >>>     sigma_tn=sigma_tn,
+            >>>     input_indices={'data': ['x']},
+            >>>     learnable_tags=['A', 'B']
+            >>> )
         """
         self.device = device if device is not None else torch.device('cpu')
         self.dtype = dtype
         
         self.learnable_tags = list(learnable_tags)
-        self.input_tags = list(input_tags) if input_tags else []
+        self.input_indices = input_indices
         
-        # Create μ network wrapper
+        # Wrap networks
         self.mu_network = QuimbTensorNetwork(
             tn=mu_tn,
             learnable_tags=learnable_tags,
-            input_tags=input_tags,
+            input_tags=[],
             device=self.device,
             dtype=self.dtype
         )
         
-        # Create Σ network (squared bond dimensions)
-        self.sigma_network = self._create_sigma_network()
+        self.sigma_network = QuimbTensorNetwork(
+            tn=sigma_tn,
+            learnable_tags=[tag + '_sigma' for tag in learnable_tags],
+            input_tags=[],
+            distributions={},
+            device=self.device,
+            dtype=self.dtype
+        )
         
-        # τ distribution: Gamma(α, β) for noise precision
+        # τ distribution
         if tau_alpha is None or tau_beta is None:
             self._tau_alpha = torch.tensor(2.0, device=self.device, dtype=self.dtype)
             self._tau_beta = torch.tensor(1.0, device=self.device, dtype=self.dtype)
@@ -85,91 +118,6 @@ class BayesianTensorNetwork:
         # Initialize prior hyperparameters
         self._initialize_prior_hyperparameters()
     
-    @property
-    def tau_alpha(self) -> torch.Tensor:
-        """Get tau alpha parameter."""
-        return self._tau_alpha
-    
-    @property
-    def tau_beta(self) -> torch.Tensor:
-        """Get tau beta parameter."""
-        return self._tau_beta
-    
-    def _create_sigma_network(self) -> QuimbTensorNetwork:
-        """
-        Create Sigma network with squared bond dimensions.
-        
-        For each learnable tensor with indices (i, j, k), create a sigma tensor
-        with indices (io, ii, jo, ji, ko, ki) with squared dimensions.
-        
-        For each input with index x, create TWO input nodes with xo and xi.
-        
-        Similar to BayesianMPO._create_sigma_nodes()
-        """
-        sigma_tn_tensors = []
-        
-        for tag in self.learnable_tags:
-            mu_tensor = self.mu_network.mu_tn[tag]  # type: ignore
-            
-            # Create doubled indices with 'o' (outer) and 'i' (inner) suffixes
-            orig_inds = mu_tensor.inds  # type: ignore
-            sigma_inds = []
-            sigma_shape = []
-            
-            for ind, dim in zip(orig_inds, mu_tensor.shape):  # type: ignore
-                # Add outer then inner: xo, xi
-                sigma_inds.append(ind + 'o')
-                sigma_inds.append(ind + 'i')
-                sigma_shape.extend([dim, dim])
-            
-            # Initialize Sigma as small diagonal
-            data = np.zeros(sigma_shape)
-            # Set diagonal elements to small values
-            for idx in np.ndindex(*[dim for dim in mu_tensor.shape]):  # type: ignore
-                sigma_idx = []
-                for i in idx:
-                    sigma_idx.extend([i, i])
-                data[tuple(sigma_idx)] = 0.01
-            
-            sigma_tensor = qtn.Tensor(
-                data=data,  # type: ignore
-                inds=tuple(sigma_inds),
-                tags=tag + '_sigma'
-            )
-            sigma_tn_tensors.append(sigma_tensor)
-        
-        # Add input nodes - doubled for outer and inner
-        for tag in self.input_tags:
-            mu_input = self.mu_network.mu_tn[tag]  # type: ignore
-            input_data = mu_input.data  # type: ignore
-            input_inds = mu_input.inds  # type: ignore
-            
-            # Create outer input: replace x with xo
-            inds_outer = tuple(ind + 'o' if ind not in ['batch', 's'] else ind for ind in input_inds)
-            input_outer = qtn.Tensor(data=input_data, inds=inds_outer, tags=tag + '_o')  # type: ignore
-            sigma_tn_tensors.append(input_outer)
-            
-            # Create inner input: replace x with xi  
-            inds_inner = tuple(ind + 'i' if ind not in ['batch', 's'] else ind for ind in input_inds)
-            input_inner = qtn.Tensor(data=input_data, inds=inds_inner, tags=tag + '_i')  # type: ignore
-            sigma_tn_tensors.append(input_inner)
-        
-        sigma_tn = qtn.TensorNetwork(sigma_tn_tensors)
-        
-        # Create wrapper (no bond distributions for sigma network)
-        # Input tags include both outer and inner versions
-        sigma_input_tags = [tag + '_o' for tag in self.input_tags] + [tag + '_i' for tag in self.input_tags]
-        
-        sigma_network = QuimbTensorNetwork(
-            tn=sigma_tn,
-            learnable_tags=[tag + '_sigma' for tag in self.learnable_tags],
-            input_tags=sigma_input_tags,
-            distributions={},  # Sigma network doesn't have its own distributions
-            device=self.device,
-            dtype=self.dtype
-        )
-        
-        return sigma_network
     
     def _initialize_prior_hyperparameters(self) -> None:
         """
@@ -210,205 +158,204 @@ class BayesianTensorNetwork:
         inputs: Optional[Dict[str, torch.Tensor]] = None
     ) -> torch.Tensor:
         """
-        Compute projection T_i (Jacobian) for a node.
+        Compute projection (Jacobian) for a node.
         
-        This is the key operation: ∂(network_output) / ∂(node_i)
+        This is ∂(network_output) / ∂(node_i) = T_i
         
-        The projection is computed by contracting the entire network EXCEPT node i.
+        NEW APPROACH:
+        - Remove target parameter node from network
+        - Combine remaining parameters with ALL input samples
+        - Return tensor with shape (batch_size, *node_shape)
         
         Args:
-            node_tag: Tag of the node to compute projection for
+            node_tag: Tag of the parameter node to compute projection for
             network_type: 'mu' or 'sigma'
-            inputs: Dictionary mapping input tags to input data
+            inputs: Dictionary mapping input names to batched input data
+                   Shape: (batch_size, features)
             
         Returns:
-            Projection tensor with same indices as the node
+            Projection tensor: (batch_size, *node_shape)
+            This is the Jacobian - when contracted with the node, gives output
         """
+        if inputs is None:
+            raise ValueError("Inputs must be provided for projection computation")
+        
         network = self.mu_network if network_type == 'mu' else self.sigma_network
         tn = network.mu_tn
         
-        # Get the target node
+        # Get target node
         target_tag = node_tag if network_type == 'mu' else node_tag + '_sigma'
         target_tensor = tn[target_tag]  # type: ignore
+        target_shape = target_tensor.shape  # type: ignore
         target_inds = target_tensor.inds  # type: ignore
         
-        # Collect all tensors EXCEPT the target node
-        projection_tensors = []
+        # Get batch size from first input
+        first_input = list(inputs.values())[0]
+        batch_size = first_input.shape[0]
         
-        for tid, tensor in tn.tensor_map.items():
-            tag = list(tensor.tags)[0] if tensor.tags else tid
+        # Process each sample separately to get Jacobian
+        projections = []
+        
+        for i in range(batch_size):
+            # Get single sample
+            sample_inputs = {k: v[i] for k, v in inputs.items()}
             
-            # Skip the target node
-            if tag == target_tag:
-                continue
-            
-            # Handle input nodes - replace with actual data if provided
-            if tag in self.input_tags and inputs is not None and tag in inputs:
-                input_data = inputs[tag]
-                if isinstance(input_data, torch.Tensor):
-                    input_data = input_data.detach().cpu().numpy()
-                projection_tensors.append(
-                    qtn.Tensor(data=input_data, inds=tensor.inds, tags=tag)  # type: ignore
-                )
-            else:
+            # Create network WITHOUT the target node
+            projection_tensors = []
+            for tid, tensor in tn.tensor_map.items():
+                tag = list(tensor.tags)[0] if tensor.tags else tid
+                
+                # Skip the target node
+                if tag == target_tag:
+                    continue
+                
                 projection_tensors.append(tensor)
-        
-        if not projection_tensors:
-            # Edge case: only one node in network
-            # Return identity-like tensor
-            shape = target_tensor.shape  # type: ignore
-            identity = torch.eye(int(np.prod(shape)), device=self.device, dtype=self.dtype)
-            identity = identity.reshape(*shape, *shape)
-            return identity
-        
-        # Create temporary network and contract
-        projection_tn = qtn.TensorNetwork(projection_tensors)
-        
-        # Figure out which indices should remain as outputs
-        # These are indices that appear an odd number of times (will be free after contraction)
-        all_inds = []
-        for t in projection_tensors:
-            all_inds.extend(t.inds)  # type: ignore
-        
-        # Count index occurrences
-        from collections import Counter
-        ind_counts = Counter(all_inds)
-        
-        # Output indices are those that appear an odd number of times
-        # (these will be uncontracted after the network contraction)
-        # OR those that appear more than twice (hyper-indices)
-        output_inds_list = []
-        for ind, count in ind_counts.items():
-            if count == 1 or count % 2 == 1 or count > 2:
-                output_inds_list.append(ind)
-        
-        output_inds = tuple(output_inds_list)
-        
-        # Contract everything, keeping target indices (and hyper-indices) free
-        try:
-            result = projection_tn.contract(..., output_inds=output_inds, optimize='auto-hq')  # type: ignore
-        except Exception as e:
-            # Fallback to simpler contraction
+            
+            # Add input tensors
+            # IMPORTANT: Create SEPARATE tensor for EACH index (for polynomial features)
+            for input_name, input_data in sample_inputs.items():
+                if input_name not in self.input_indices:
+                    continue
+                
+                contract_indices = self.input_indices[input_name]
+                
+                # Convert to numpy
+                if isinstance(input_data, torch.Tensor):
+                    input_data_np = input_data.detach().cpu().numpy()
+                else:
+                    input_data_np = np.asarray(input_data)
+                
+                # Create SEPARATE input tensor for EACH index
+                for idx in contract_indices:
+                    input_tensor = qtn.Tensor(
+                        data=input_data_np,
+                        inds=(idx,),  # Single index
+                        tags=f'input_{input_name}_{idx}'
+                    )  # type: ignore
+                    
+                    projection_tensors.append(input_tensor)
+            
+            # Create projection network and contract
+            if not projection_tensors:
+                # Edge case: only one node, return identity
+                identity = torch.eye(int(np.prod(target_shape)), device=self.device, dtype=self.dtype)
+                identity = identity.reshape(*target_shape, *target_shape)
+                return identity
+            
+            proj_tn = qtn.TensorNetwork(projection_tensors)
+            
+            # Contract, keeping target indices free
+            # The output should have the indices that would connect to the target node
             try:
-                result = projection_tn.contract(..., output_inds=output_inds, optimize='greedy')  # type: ignore
-            except Exception as e2:
-                # Last resort: use default contraction
-                result = projection_tn.contract(..., output_inds=output_inds)  # type: ignore
+                result = proj_tn.contract(output_inds=target_inds, optimize='auto-hq')  # type: ignore
+            except:
+                try:
+                    result = proj_tn.contract(output_inds=target_inds, optimize='greedy')  # type: ignore
+                except:
+                    result = proj_tn.contract(output_inds=target_inds)  # type: ignore
+            
+            # Convert to PyTorch
+            result_array = result.data if hasattr(result, 'data') else result  # type: ignore
+            
+            if isinstance(result_array, np.ndarray):
+                result_tensor = torch.from_numpy(result_array).to(device=self.device, dtype=self.dtype)
+            else:
+                result_tensor = torch.as_tensor(result_array, device=self.device, dtype=self.dtype)
+            
+            projections.append(result_tensor)
         
-        # Convert to PyTorch
-        result_array = result.data  # type: ignore
-        
-        if isinstance(result_array, np.ndarray):
-            result_tensor = torch.from_numpy(result_array).to(device=self.device, dtype=self.dtype)
-        else:
-            # Handle scalars and other types
-            result_tensor = torch.as_tensor(result_array, device=self.device, dtype=self.dtype)
-        
-        return result_tensor
+        # Stack to get (batch_size, *node_shape)
+        return torch.stack(projections)
     
     def forward_mu(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward through μ network."""
+        return self._forward(self.mu_network.mu_tn, inputs, index_suffix='')
+    
+    def _forward_single_sample(self, tn: qtn.TensorNetwork, inputs: Dict[str, torch.Tensor], index_suffix: str) -> torch.Tensor:
         """
-        Forward pass through μ network.
+        Forward for one sample.
         
         Args:
-            inputs: Dict mapping input tags to input tensors
-            
-        Returns:
-            Network output
+            tn: TensorNetwork
+            inputs: Single sample inputs
+            index_suffix: '' for mu, 'o' for sigma outer, 'i' for sigma inner
         """
-        # Set input tensors in the network
-        for tag, data in inputs.items():
-            if tag in self.input_tags:
-                self.mu_network.set_node_tensor(tag, data)
+        tn_copy = tn.copy()
         
-        # Contract the entire network
-        tn_copy = self.mu_network.mu_tn.copy()
+        # Add input tensors
+        for input_name, input_data in inputs.items():
+            if input_name not in self.input_indices:
+                continue
+            
+            contract_indices = self.input_indices[input_name]
+            input_data_np = input_data.detach().cpu().numpy() if isinstance(input_data, torch.Tensor) else np.asarray(input_data)
+            
+            # For sigma: add BOTH 'o' and 'i' versions
+            if index_suffix:  # sigma network
+                for idx in contract_indices:
+                    # Outer
+                    tn_copy &= qtn.Tensor(data=input_data_np, inds=(idx + 'o',), tags=f'input_{idx}_o')  # type: ignore
+                    # Inner  
+                    tn_copy &= qtn.Tensor(data=input_data_np, inds=(idx + 'i',), tags=f'input_{idx}_i')  # type: ignore
+            else:  # mu network
+                for idx in contract_indices:
+                    tn_copy &= qtn.Tensor(data=input_data_np, inds=(idx,), tags=f'input_{idx}')  # type: ignore
         
-        # Check if we need to specify output_inds (for hyper-indices)
-        all_inds = []
-        for t in tn_copy.tensor_map.values():
-            all_inds.extend(t.inds)  # type: ignore
-        
+        # Contract with hyper-index handling
         from collections import Counter
+        all_inds = [ind for t in tn_copy.tensor_map.values() for ind in t.inds]  # type: ignore
         ind_counts = Counter(all_inds)
-        
-        # If any index appears more than twice, we need to specify output_inds
         hyper_inds = [ind for ind, count in ind_counts.items() if count > 2]
         
         if hyper_inds:
-            # For forward pass, we want all indices that appear once (open indices)
-            output_inds = tuple([ind for ind, count in ind_counts.items() if count == 1])
-            result = tn_copy.contract(..., output_inds=output_inds, optimize='auto-hq')
+            output_inds = tuple([ind for ind, count in ind_counts.items() if count == 1 or count > 2])
+            try:
+                result = tn_copy.contract(output_inds=output_inds, optimize='auto-hq')
+            except:
+                result = tn_copy.contract(output_inds=output_inds, optimize='greedy')
         else:
-            result = tn_copy.contract(optimize='auto-hq')
+            try:
+                result = tn_copy.contract(optimize='auto-hq')
+            except:
+                result = tn_copy.contract(optimize='greedy')
         
-        # Convert to PyTorch
-        # Check if result is a Tensor object or a scalar
-        if hasattr(result, 'data'):
-            result_array = result.data  # type: ignore
-        else:
-            result_array = result
-        
+        # Convert to tensor
+        result_array = result.data if hasattr(result, 'data') else result  # type: ignore
         if isinstance(result_array, np.ndarray):
             result_tensor = torch.from_numpy(result_array).to(device=self.device, dtype=self.dtype)
         elif isinstance(result_array, (int, float, np.number)):
-            # Scalar number
             result_tensor = torch.tensor(float(result_array), device=self.device, dtype=self.dtype)
         else:
-            # For memoryview or other types, try numpy conversion first
-            result_array_np = np.asarray(result_array)
-            result_tensor = torch.from_numpy(result_array_np).to(device=self.device, dtype=self.dtype)
+            result_tensor = torch.from_numpy(np.asarray(result_array)).to(device=self.device, dtype=self.dtype)
         
-        return result_tensor
+        return result_tensor.squeeze()
     
     def forward_sigma(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Forward through Σ network."""
+        return self._forward(self.sigma_network.mu_tn, inputs, index_suffix='o')
+
+    def _forward(self, tn: qtn.TensorNetwork, inputs: Dict[str, torch.Tensor], index_suffix: str) -> torch.Tensor:
         """
-        Forward pass through Σ network.
-        
-        The sigma network has doubled indices (outer and inner).
-        We set the SAME input data to both outer and inner input nodes.
+        Generic batched forward pass.
         
         Args:
-            inputs: Dict mapping input tags to input tensors (same as for mu)
-            
-        Returns:
-            Variance of network output
+            tn: The TensorNetwork (mu or sigma)
+            inputs: Input data
+            index_suffix: '' for mu, 'o'/'i' for sigma
         """
-        # For sigma network, set the SAME input to both outer and inner nodes
-        for tag, data in inputs.items():
-            if tag in self.input_tags:
-                # Set to outer version
-                self.sigma_network.set_node_tensor(tag + '_o', data)
-                # Set to inner version (same data)
-                self.sigma_network.set_node_tensor(tag + '_i', data)
+        first_input = list(inputs.values())[0]
+        is_batched = first_input.dim() > 1
         
-        # Contract the sigma network
-        tn_copy = self.sigma_network.mu_tn.copy()
-        
-        # Check for hyper-indices
-        all_inds = []
-        for t in tn_copy.tensor_map.values():
-            all_inds.extend(t.inds)  # type: ignore
-        
-        from collections import Counter
-        ind_counts = Counter(all_inds)
-        hyper_inds = [ind for ind, count in ind_counts.items() if count > 2]
-        
-        if hyper_inds:
-            output_inds = tuple([ind for ind, count in ind_counts.items() if count == 1])
-            result = tn_copy.contract(..., output_inds=output_inds, optimize='auto-hq')
+        if is_batched:
+            batch_size = first_input.shape[0]
+            outputs = []
+            for i in range(batch_size):
+                sample_inputs = {k: v[i] for k, v in inputs.items()}
+                out = self._forward_single_sample(tn, sample_inputs, index_suffix)
+                outputs.append(out)
+            return torch.stack(outputs)
         else:
-            result = tn_copy.contract(optimize='auto-hq')
-        
-        # Convert to PyTorch
-        result_array = result.data  # type: ignore
-        if isinstance(result_array, np.ndarray):
-            result_tensor = torch.from_numpy(result_array).to(device=self.device, dtype=self.dtype)
-        else:
-            # Handle scalars and other types
-            result_tensor = torch.as_tensor(result_array, device=self.device, dtype=self.dtype)
-        
-        return result_tensor
+            return self._forward_single_sample(tn, inputs, index_suffix)
     
     def to(self, device: torch.device) -> 'BayesianTensorNetwork':
         """Move all components to device."""
