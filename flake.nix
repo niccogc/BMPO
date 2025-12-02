@@ -29,8 +29,9 @@
         scipy
         matplotlib
         scikit-learn
-        # jax
-        # quimb
+        pytest
+        jax
+        quimb
       ]);
 
     opencodecfg = pkgs.writeText "opencodecfg.jsonc" ''
