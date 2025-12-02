@@ -26,6 +26,8 @@ $$
 
 ## 2. Data Structures & State Variables
 
+Often we will use polynomial models, so there should be support for repeated input nodes. Meaning that 3 repeated nodes shouldnt occupy three times the memory.
+
 ### 2.1 Node Parameters (Gaussian)
 For every node $i$, the distribution $Q_i$ is parameterized by:
 *   **$\bm{\mu}^i$ (Mean Tensor):** $\mathbb{E}[A^i]$. Maintains the original topology/dimensions of the tensor network.
@@ -44,7 +46,7 @@ For every bond (edge) $i$, the distribution $q_i$ is a Gamma distribution over d
 ## 3. Helper Definitions
 
 *   **$B(i)$:** Set of bonds connected to Node $i$.
-*   **$A(k)$:** Set of nodes connected to Bond $k$.
+*   **$A(k)$:** Set of learnable nodes (excludes inputs and fixed nodes) connected to Bond $k$.
 *   **$T_i \bm{A}$ (Projection):** The derivative $\frac{\partial \bm{A}}{\partial A^i}$. represents the contraction of the entire network *excluding* node $A^i$.
 *   **$\bm{\theta}^{B(i)}$ (Bond Expectations):** A tensor representing the expectation of the bond variables connected to node $i$.
     $$ \theta^{B(i)} = \bigotimes_{b \in B(i)} \mathbb{E}[\vec{\lambda}_b] \quad \text{where } \mathbb{E}[\lambda] = \alpha / \beta $$
@@ -69,8 +71,9 @@ $$
 ### Step 2: Update Bond Distributions ($q_{bond}$)
 Update the Gamma parameters for bond $i$.
 *   $\text{dim}(i)$: Dimension of bond $i$.
-*   $|A(i)|$: Number of nodes sharing bond $i$.
+*   $|A(i)|$: Number of learnable nodes sharing bond $i$.
 *   $\text{tr}_{B(a)/i}$: Partial trace over all bonds of node $a$ *except* bond $i$.
+*   Trace of a diagonal matrix by a full matrix has a simple form to be computed.
 
 $$
 \begin{aligned}
