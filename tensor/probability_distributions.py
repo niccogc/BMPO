@@ -365,10 +365,14 @@ class ProductDistribution:
         For independent distributions: H(X1, X2, ..., Xn) = H(X1) + H(X2) + ... + H(Xn)
         
         Returns:
-            Total entropy (scalar or tensor)
+            Total entropy (scalar)
         """
         entropies = [d.entropy() for d in self.distributions]
-        return sum(entropies)
+        # Sum all elements of all entropy tensors to get a scalar
+        total = torch.tensor(0.0, dtype=entropies[0].dtype, device=entropies[0].device)
+        for ent in entropies:
+            total = total + ent.sum()
+        return total
     
     def sample(self, sample_shape=torch.Size()):
         """
