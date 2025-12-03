@@ -9,6 +9,11 @@ import numpy as np
 import quimb.tensor as qtn
 from typing import List
 
+try:
+    import autoray as ar
+except ImportError:
+    ar = None  # type: ignore
+
 
 def create_sigma_network(mu_tn: qtn.TensorNetwork, learnable_tags: List[str]) -> qtn.TensorNetwork:
     """
@@ -53,7 +58,16 @@ def create_sigma_network(mu_tn: qtn.TensorNetwork, learnable_tags: List[str]) ->
         
         # Initialize sigma tensor as small diagonal
         # This represents small initial uncertainty
-        data = np.zeros(sigma_shape, dtype=np.float64)
+        # BACKEND-AGNOSTIC: Infer backend from mu_tensor and use autoray
+        mu_data = mu_tensor.data  # type: ignore[union-attr]
+        
+        if ar is not None:
+            backend = ar.infer_backend(mu_data)
+            # Use autoray to create zeros in the same backend as mu_data
+            data = ar.do('zeros', sigma_shape, like=mu_data)
+        else:
+            # Fallback to numpy if autoray not available
+            data = np.zeros(sigma_shape, dtype=np.float64)
         
         # Set diagonal elements
         # For a tensor with shape (d1, d2, ...), the diagonal is where all indices match
@@ -66,10 +80,10 @@ def create_sigma_network(mu_tn: qtn.TensorNetwork, learnable_tags: List[str]) ->
         
         # Create sigma tensor
         sigma_tensor = qtn.Tensor(
-            data=data,
+            data=data,  # type: ignore[arg-type]
             inds=tuple(sigma_inds),
             tags=tag + '_sigma'
-        )  # type: ignore
+        )
         
         sigma_tensors.append(sigma_tensor)
     

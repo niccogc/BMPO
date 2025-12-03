@@ -160,12 +160,13 @@ class BayesianTensorNetwork:
         """
         Compute projection (Jacobian) for a node.
         
-        This is ∂(network_output) / ∂(node_i) = T_i
+        This is the environment tensor: when contracted with the node, gives network output.
         
-        NEW APPROACH:
-        - Remove target parameter node from network
-        - Combine remaining parameters with ALL input samples
-        - Return tensor with shape (batch_size, *node_shape)
+        APPROACH:
+        - Remove target node from network
+        - Add input tensors
+        - Contract keeping target's SHARED indices free (using output_inds)
+        - Process each sample in batch separately
         
         Args:
             node_tag: Tag of the parameter node to compute projection for
@@ -175,7 +176,12 @@ class BayesianTensorNetwork:
             
         Returns:
             Projection tensor: (batch_size, *node_shape)
-            This is the Jacobian - when contracted with the node, gives output
+            Shape matches the full node shape including boundaries.
+            Dummy nodes (ones) are added for boundary indices to preserve shape.
+            
+        Example:
+            Node A has shape (r0=1, p1=2, r1=2) where r0 is a boundary.
+            Projection will have shape (batch, r0=1, p1=2, r1=2) - full shape.
         """
         if inputs is None:
             raise ValueError("Inputs must be provided for projection computation")
@@ -185,87 +191,254 @@ class BayesianTensorNetwork:
         
         # Get target node
         target_tag = node_tag if network_type == 'mu' else node_tag + '_sigma'
-        target_tensor = tn[target_tag]  # type: ignore
-        target_shape = target_tensor.shape  # type: ignore
-        target_inds = target_tensor.inds  # type: ignore
+        target_tensor = tn[target_tag]  # type: ignore[index]
+        target_inds = target_tensor.inds  # type: ignore[union-attr]
         
-        # Get batch size from first input
+        # Get batch size
         first_input = list(inputs.values())[0]
-        batch_size = first_input.shape[0]
+        batch_size = first_input.shape[0] if first_input.dim() > 1 else 1
+        is_batched = first_input.dim() > 1
         
-        # Process each sample separately to get Jacobian
+        if not is_batched:
+            # Single sample
+            return self._compute_projection_single_sample(tn, target_tag, target_inds, inputs, network_type)
+        
+        # Batch: process each sample separately
         projections = []
-        
         for i in range(batch_size):
-            # Get single sample
             sample_inputs = {k: v[i] for k, v in inputs.items()}
-            
-            # Create network WITHOUT the target node
-            projection_tensors = []
-            for tid, tensor in tn.tensor_map.items():
-                tag = list(tensor.tags)[0] if tensor.tags else tid
-                
-                # Skip the target node
-                if tag == target_tag:
-                    continue
-                
-                projection_tensors.append(tensor)
-            
-            # Add input tensors
-            # IMPORTANT: Create SEPARATE tensor for EACH index (for polynomial features)
-            for input_name, input_data in sample_inputs.items():
-                if input_name not in self.input_indices:
-                    continue
-                
-                contract_indices = self.input_indices[input_name]
-                
-                # Convert to numpy
-                if isinstance(input_data, torch.Tensor):
-                    input_data_np = input_data.detach().cpu().numpy()
-                else:
-                    input_data_np = np.asarray(input_data)
-                
-                # Create SEPARATE input tensor for EACH index
-                for idx in contract_indices:
-                    input_tensor = qtn.Tensor(
-                        data=input_data_np,
-                        inds=(idx,),  # Single index
-                        tags=f'input_{input_name}_{idx}'
-                    )  # type: ignore
-                    
-                    projection_tensors.append(input_tensor)
-            
-            # Create projection network and contract
-            if not projection_tensors:
-                # Edge case: only one node, return identity
-                identity = torch.eye(int(np.prod(target_shape)), device=self.device, dtype=self.dtype)
-                identity = identity.reshape(*target_shape, *target_shape)
-                return identity
-            
-            proj_tn = qtn.TensorNetwork(projection_tensors)
-            
-            # Contract, keeping target indices free
-            # The output should have the indices that would connect to the target node
-            try:
-                result = proj_tn.contract(output_inds=target_inds, optimize='auto-hq')  # type: ignore
-            except:
-                try:
-                    result = proj_tn.contract(output_inds=target_inds, optimize='greedy')  # type: ignore
-                except:
-                    result = proj_tn.contract(output_inds=target_inds)  # type: ignore
-            
-            # Convert to PyTorch
-            result_array = result.data if hasattr(result, 'data') else result  # type: ignore
-            
-            if isinstance(result_array, np.ndarray):
-                result_tensor = torch.from_numpy(result_array).to(device=self.device, dtype=self.dtype)
-            else:
-                result_tensor = torch.as_tensor(result_array, device=self.device, dtype=self.dtype)
-            
-            projections.append(result_tensor)
+            proj = self._compute_projection_single_sample(tn, target_tag, target_inds, sample_inputs, network_type)
+            projections.append(proj)
         
-        # Stack to get (batch_size, *node_shape)
         return torch.stack(projections)
+    
+    def _compute_projection_single_sample(
+        self,
+        tn: qtn.TensorNetwork,
+        target_tag: str,
+        target_inds: tuple,
+        inputs: Dict[str, torch.Tensor],
+        network_type: str
+    ) -> torch.Tensor:
+        """
+        Compute projection (Jacobian) for a single sample.
+        
+        Strategy:
+        1. Build environment WITHOUT target node
+        2. Add input tensors
+        3. Contract keeping target's indices free (those that exist in environment)
+        4. Returns tensor with shape matching the shared indices
+        
+        Args:
+            tn: The tensor network
+            target_tag: Tag of target node to exclude
+            target_inds: Indices of target node
+            inputs: Single sample inputs (no batch dimension)
+            network_type: 'mu' or 'sigma'
+            
+        Returns:
+            Projection tensor with shape corresponding to shared indices
+        """
+        # Build environment network WITHOUT target node
+        env_tensors = []
+        for tid, tensor in tn.tensor_map.items():
+            tag = list(tensor.tags)[0] if tensor.tags else tid  # type: ignore[union-attr]
+            if tag == target_tag:
+                continue  # Skip target node
+            env_tensors.append(tensor)
+        
+        # Get target node to check for boundary indices
+        target_node = tn[target_tag]  # type: ignore[index]
+        target_shape = target_node.shape  # type: ignore[union-attr]
+        
+        # Find boundary indices (indices that only appear in target node)
+        # Count index occurrences in the FULL network (including target)
+        from collections import Counter
+        all_inds_with_target = []
+        for t in tn.tensor_map.items():
+            all_inds_with_target.extend(t[1].inds)  # type: ignore[union-attr]
+        ind_counts_full = Counter(all_inds_with_target)
+        
+        # Count in environment (without target)
+        all_inds_env = []
+        for t in env_tensors:
+            all_inds_env.extend(t.inds)  # type: ignore[union-attr]
+        ind_counts_env = Counter(all_inds_env)
+        
+        # Boundary indices: appear in target but not in environment
+        boundary_inds = set(target_inds) - set(ind_counts_env.keys())
+        
+        # Add dummy nodes for boundary indices
+        for i, ind in enumerate(target_inds):
+            if ind in boundary_inds:
+                # Get dimension for this index
+                idx_pos = target_inds.index(ind)
+                dim_size = target_shape[idx_pos]  # type: ignore[index]
+                
+                # Create dummy tensor (ones) with this dimension
+                import autoray as ar
+                dummy_data = ar.do('ones', (dim_size,), like=target_node.data)  # type: ignore[union-attr]
+                dummy_tensor = qtn.Tensor(
+                    data=dummy_data,  # type: ignore[arg-type]
+                    inds=(ind,),
+                    tags=f'dummy_{ind}'
+                )
+                env_tensors.append(dummy_tensor)
+        
+        # Add input tensors
+        for input_name, input_data in inputs.items():
+            if input_name not in self.input_indices:
+                continue
+            
+            contract_indices = self.input_indices[input_name]
+            
+            if network_type == 'sigma':
+                # For sigma: add BOTH 'o' and 'i' versions
+                for idx in contract_indices:
+                    env_tensors.append(qtn.Tensor(data=input_data, inds=(idx + 'o',), tags=f'input_{idx}_o'))  # type: ignore[arg-type]
+                    env_tensors.append(qtn.Tensor(data=input_data, inds=(idx + 'i',), tags=f'input_{idx}_i'))  # type: ignore[arg-type]
+            else:
+                # For mu: single version
+                for idx in contract_indices:
+                    env_tensors.append(qtn.Tensor(data=input_data, inds=(idx,), tags=f'input_{idx}'))  # type: ignore[arg-type]
+        
+        # Create environment network
+        env_tn = qtn.TensorNetwork(env_tensors)
+        
+        # Contract environment, keeping ALL target indices free
+        # (including boundaries, which now have dummy nodes)
+        try:
+            env_result = env_tn.contract(output_inds=target_inds, optimize='greedy')  # type: ignore[call-overload]
+        except:
+            try:
+                env_result = env_tn.contract(output_inds=target_inds)  # type: ignore[call-overload]
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to contract environment for {target_tag}. "
+                    f"Target indices: {target_inds}. Error: {e}"
+                )
+        
+        # Convert to torch
+        result_data = env_result.data if hasattr(env_result, 'data') else env_result  # type: ignore[union-attr]
+        
+        if isinstance(result_data, torch.Tensor):
+            result_tensor = result_data.to(device=self.device, dtype=self.dtype)
+        elif isinstance(result_data, np.ndarray):
+            result_tensor = torch.from_numpy(result_data).to(device=self.device, dtype=self.dtype)
+        elif isinstance(result_data, (int, float, np.number)):
+            result_tensor = torch.tensor(float(result_data), device=self.device, dtype=self.dtype)
+        else:
+            result_tensor = torch.from_numpy(np.asarray(result_data)).to(device=self.device, dtype=self.dtype)
+        
+        return result_tensor
+    
+    def compute_projection_grad(
+        self,
+        node_tag: str,
+        network_type: str = 'mu',
+        inputs: Optional[Dict[str, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        """
+        Compute projection (Jacobian) using automatic differentiation.
+        
+        Alternative to compute_projection() - uses backend's autodiff instead of
+        manual tensor contraction. Should give identical results.
+        
+        Computes: ∂(output) / ∂(node) for each sample in batch
+        
+        Args:
+            node_tag: Tag of the parameter node
+            network_type: 'mu' or 'sigma'
+            inputs: Dictionary mapping input names to batched input data
+            
+        Returns:
+            Projection tensor: (batch_size, *node_shape)
+            Gradient of network output w.r.t. the target node
+        """
+        if inputs is None:
+            raise ValueError("Inputs must be provided for projection computation")
+        
+        network = self.mu_network if network_type == 'mu' else self.sigma_network
+        
+        # Get target node
+        target_tag = node_tag if network_type == 'mu' else node_tag + '_sigma'
+        node_tensor = network.get_node_tensor(target_tag)
+        
+        # Get batch info
+        first_input = list(inputs.values())[0]
+        is_batched = first_input.dim() > 1
+        batch_size = first_input.shape[0] if is_batched else 1
+        
+        if not is_batched:
+            # Single sample
+            return self._compute_projection_grad_single(node_tag, network_type, inputs)
+        
+        # Batch: process each sample
+        projections = []
+        for i in range(batch_size):
+            sample_inputs = {k: v[i] for k, v in inputs.items()}
+            proj = self._compute_projection_grad_single(node_tag, network_type, sample_inputs)
+            projections.append(proj)
+        
+        return torch.stack(projections)
+    
+    def _compute_projection_grad_single(
+        self,
+        node_tag: str,
+        network_type: str,
+        inputs: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Compute projection for single sample using autograd.
+        
+        OPTIMIZED: Only tracks gradients for target node, not entire network.
+        
+        Args:
+            node_tag: Tag of the parameter node
+            network_type: 'mu' or 'sigma'
+            inputs: Single sample inputs (no batch dimension)
+            
+        Returns:
+            Gradient tensor with shape matching node shape
+        """
+        network = self.mu_network if network_type == 'mu' else self.sigma_network
+        target_tag = node_tag if network_type == 'mu' else node_tag + '_sigma'
+        
+        # Get node tensor and make ONLY it require gradients
+        node_tensor = network.get_node_tensor(target_tag).detach().clone()
+        node_tensor.requires_grad_(True)
+        
+        # Temporarily replace node in network
+        original_data = network.mu_tn[target_tag].data  # type: ignore[index]
+        network.mu_tn[target_tag].modify(data=node_tensor)  # type: ignore[index,union-attr]
+        
+        try:
+            # Forward pass - only node_tensor has requires_grad=True
+            with torch.enable_grad():
+                if network_type == 'mu':
+                    output = self.forward_mu(inputs)
+                else:
+                    output = self.forward_sigma(inputs)
+                
+                # Compute gradient (only for target node)
+                if output.dim() == 0:
+                    output_scalar = output
+                else:
+                    output_scalar = output.sum()  # Sum if multiple outputs
+                
+                # Backward - only computes grad for node_tensor
+                output_scalar.backward()
+                
+                # Extract gradient
+                grad = node_tensor.grad
+                
+                if grad is None:
+                    raise RuntimeError(f"Gradient is None for node {target_tag}")
+                
+                return grad.detach().clone()
+        finally:
+            # Always restore original node data
+            network.mu_tn[target_tag].modify(data=original_data)  # type: ignore[index,union-attr]
     
     def forward_mu(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward through μ network."""
@@ -275,31 +448,33 @@ class BayesianTensorNetwork:
         """
         Forward for one sample.
         
+        Backend-agnostic: keeps data in native format (torch/jax/numpy).
+        Quimb uses autoray for backend abstraction.
+        
         Args:
             tn: TensorNetwork
-            inputs: Single sample inputs
+            inputs: Single sample inputs (torch.Tensor or other backend)
             index_suffix: '' for mu, 'o' for sigma outer, 'i' for sigma inner
         """
         tn_copy = tn.copy()
         
-        # Add input tensors
+        # Add input tensors - NO conversion, let quimb handle backend
         for input_name, input_data in inputs.items():
             if input_name not in self.input_indices:
                 continue
             
             contract_indices = self.input_indices[input_name]
-            input_data_np = input_data.detach().cpu().numpy() if isinstance(input_data, torch.Tensor) else np.asarray(input_data)
             
             # For sigma: add BOTH 'o' and 'i' versions
             if index_suffix:  # sigma network
                 for idx in contract_indices:
-                    # Outer
-                    tn_copy &= qtn.Tensor(data=input_data_np, inds=(idx + 'o',), tags=f'input_{idx}_o')  # type: ignore
+                    # Outer - quimb accepts any array backend (numpy/torch/jax)
+                    tn_copy &= qtn.Tensor(data=input_data, inds=(idx + 'o',), tags=f'input_{idx}_o')  # type: ignore[arg-type]
                     # Inner  
-                    tn_copy &= qtn.Tensor(data=input_data_np, inds=(idx + 'i',), tags=f'input_{idx}_i')  # type: ignore
+                    tn_copy &= qtn.Tensor(data=input_data, inds=(idx + 'i',), tags=f'input_{idx}_i')  # type: ignore[arg-type]
             else:  # mu network
                 for idx in contract_indices:
-                    tn_copy &= qtn.Tensor(data=input_data_np, inds=(idx,), tags=f'input_{idx}')  # type: ignore
+                    tn_copy &= qtn.Tensor(data=input_data, inds=(idx,), tags=f'input_{idx}')  # type: ignore[arg-type]
         
         # Contract with hyper-index handling
         from collections import Counter
@@ -319,14 +494,19 @@ class BayesianTensorNetwork:
             except:
                 result = tn_copy.contract(optimize='greedy')
         
-        # Convert to tensor
-        result_array = result.data if hasattr(result, 'data') else result  # type: ignore
-        if isinstance(result_array, np.ndarray):
-            result_tensor = torch.from_numpy(result_array).to(device=self.device, dtype=self.dtype)
-        elif isinstance(result_array, (int, float, np.number)):
-            result_tensor = torch.tensor(float(result_array), device=self.device, dtype=self.dtype)
+        # Extract result - quimb returns Tensor or scalar
+        result_data = result.data if hasattr(result, 'data') else result  # type: ignore[union-attr]
+        
+        # Convert to appropriate tensor type if needed
+        if isinstance(result_data, torch.Tensor):
+            result_tensor = result_data.to(device=self.device, dtype=self.dtype)
+        elif isinstance(result_data, np.ndarray):
+            result_tensor = torch.from_numpy(result_data).to(device=self.device, dtype=self.dtype)
+        elif isinstance(result_data, (int, float, np.number)):
+            result_tensor = torch.tensor(float(result_data), device=self.device, dtype=self.dtype)
         else:
-            result_tensor = torch.from_numpy(np.asarray(result_array)).to(device=self.device, dtype=self.dtype)
+            # For JAX or other backends, convert via numpy
+            result_tensor = torch.from_numpy(np.asarray(result_data)).to(device=self.device, dtype=self.dtype)
         
         return result_tensor.squeeze()
     
