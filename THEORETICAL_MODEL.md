@@ -91,7 +91,7 @@ Update the precision of the likelihood.
 $$
 \begin{aligned}
     \alpha_\tau &= \alpha_\tau^0 + \frac{S}{2} \\
-    \beta_\tau &= \beta_\tau^0 - \|\bm{y}\|^2 + \bm{y} \cdot (\bm{\mu x}) + \frac{1}{2} \sum_n \left( \bm{\Sigma}(x_n \otimes x_n) + (\bm{\mu} x_n) \otimes (\bm{\mu} x_n) \right)
+    \beta_\tau &= \beta_\tau^0 + \frac{1}{2}\sum_n\|y_n -\bm{\mu}x_n\|^{2} + \frac{1}{2}\sum_n \bm{\Sigma}(x_n\otimes x_n)
 \end{aligned}
 $$
 
