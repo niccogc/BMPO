@@ -258,13 +258,12 @@ class BayesianTensorNetwork:
             Projection tensor with shape (*target_variational_inds, *other_output_inds)
         """
         # Build environment network WITHOUT target node
+        # TODO: WHY ARE WE DOING THIS? CANT WE JUST COPY THE QUIMB NETWORK, REMOVE THE NODE AND DO THE FORWARD PASS? SO AT THE END WE HAVE A QUIMB TENSOR WITH PROPER LABELS ???? OR MAYBE NOT EVEN COPYING IT, JUST REMOVE NODE -> FORWARD -> SAVE THE ENV DATA IN ANOTHER QUIMB TENSOR -> ADD THE ORIGINAL NODE BACK TO THE NETWORK (IF IT IS NEEDED BECAUSE WE WILL UPDATE IT ANYWAY SO PROBABLY NOT EVEN NEEDED.), IT IS JUST NEEDED TO SAVE THE NODE. THEN IT IS TRIVIAL WITH QUIMB TO SUM OVER SOMENODES
         env_tensors = []
         for tid, tensor in tn.tensor_map.items():
             tag = list(tensor.tags)[0] if tensor.tags else tid  # type: ignore[union-attr]
             if tag == target_tag:
                 continue  # Skip target node
-            
-            # Convert to torch if needed (backend-agnostic, prefer torch)
             # TODO: ITS NOT IF NEEDED YOU ARE ALWAYS CONVERTING IT INTO TORCH.... WHY qtn cant just get tensor? why ou have to transofrm it in torch?
             tensor_data = tensor.data  # type: ignore[union-attr]
             if not isinstance(tensor_data, torch.Tensor):
@@ -278,42 +277,17 @@ class BayesianTensorNetwork:
             else:
                 env_tensors.append(tensor)
         
-        # Get target node
-        target_node = tn[target_tag]  # type: ignore[index]
-        target_shape = target_node.shape  # type: ignore[union-attr]
-        
         # Separate target's variational indices from its output indices
-        target_output_inds = [ind for ind in target_inds if ind in self.output_indices]
         target_variational_inds = [ind for ind in target_inds if ind not in self.output_indices]
         
         # Other output indices (from other nodes)
         other_output_inds = [ind for ind in self.output_indices if ind not in target_inds]
         
         # Find boundary variational indices (target's variational indices not in environment)
-        from collections import Counter
         all_inds_env = []
         for t in env_tensors:
             all_inds_env.extend(t.inds)  # type: ignore[union-attr]
-        ind_counts_env = Counter(all_inds_env)
-        
         # Boundary variational indices: target's variational indices not in environment
-        boundary_variational_inds = [ind for ind in target_variational_inds if ind not in ind_counts_env]
-        
-        # Add dummy nodes for boundary VARIATIONAL indices only
-        # (NOT for target's output indices - they shouldn't be in the projection)
-        for ind in boundary_variational_inds:
-            idx_pos = list(target_inds).index(ind)
-            dim_size = target_shape[idx_pos]  # type: ignore[index]
-            
-            # Create dummy data as torch tensor (backend-agnostic, prefer torch)
-            dummy_data = torch.ones(dim_size, dtype=self.dtype, device=self.device)
-            dummy_tensor = qtn.Tensor(
-                data=dummy_data,  # type: ignore[arg-type]
-                inds=(ind,),
-                tags=f'dummy_{ind}'
-            )
-            env_tensors.append(dummy_tensor)
-        
         # Add input tensors
         for input_name, input_data in inputs.items():
             if input_name not in self.input_indices:
@@ -712,6 +686,7 @@ class BayesianTensorNetwork:
         Returns:
             Matrix of shape (d, d) where d = product of variational dimensions
         """
+        # TODO: AGAIN, WOULDNT BE EASIER KEEPING THEM AS QUIMB TENSORS?
         # Get mu node info
         mu_node = self.mu_network.mu_tn[node_tag]  # type: ignore[index]
         mu_inds = mu_node.inds  # type: ignore[union-attr]
@@ -902,6 +877,7 @@ class BayesianTensorNetwork:
         
         # J_mu_all has shape: (batch, ...var_dims, ...other_output_dims)
         # The last dimensions after var_dims are OTHER output dimensions (not from this block)
+        # TODO: WHO SAID IT IS FOR THE LAST DIMENSIONS? J_MU_ALL SHOULD BE A QUIMB TENSOR SO IT IS LABELED AND YOU DONT NEED TO GUESS
         n_other_output_dims = J_mu_all.ndim - 1 - n_var_dims  # -1 for batch dim
         
         # Create dynamic labels for einsum based on actual dimensions
@@ -933,6 +909,7 @@ class BayesianTensorNetwork:
         
         # Get this node's output dimensions
         _, node_out_shape = self.get_node_dimensions(node_tag)
+        # TODO: AGAIN, YOU WOULDNT NEED LEN IF THEY WHERE QUIMB TENSORS.
         n_node_out_dims = len(node_out_shape)
         
         # Total output dims in y = len(self.output_indices)
@@ -1020,7 +997,7 @@ class BayesianTensorNetwork:
         # Compute Σ^{-1} = Θ + E[τ] * (sum_J_sigma + sum_J_mu_outer)
         # All tensors have shape (var_shape, var_shape) for variational dimensions only
         # TODO: here I am squeezing, but it is wrong! THETA IS BEING COMPUTED WITH OUTERDIMS_SHAPE, IT SHOULDNT, PLEASE LABEL AND USER QUIMB TENSORS
-        sigma_inv_var = E_tau * (sum_J_sigma + sum_J_mu_outer) + theta.squeeze()
+        sigma_inv_var = E_tau * (sum_J_sigma + sum_J_mu_outer) + theta
         
         # Flatten only variational dims for Cholesky solve
         # TODO: YOU NEED TO USE LABELS, TO DO SO YOU NEED TO HAVE ALL ALSO ENVIRONMENT AND ANY COMPUTATION TO BE QUIMB TENSORS, INHERITING THE LABELS. AND JUST MAKE THEM TORCH ONLY WHEN WE NEED TO DO OPERATIONS NOT PRESENT FOR QUIMB TENSORS.
