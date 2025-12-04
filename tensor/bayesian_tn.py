@@ -164,6 +164,7 @@ class BayesianTensorNetwork:
         network_type: str = 'mu',
         inputs: Optional[Dict[str, torch.Tensor]] = None
     ) -> torch.Tensor:
+        # TODO: WHY IT GIVES A TORCH TENSOR? WOULDNT BE BETTER FOR IT TO RETURN A GENERAL QUIMB NODE WITH LABELS? SO WE ARE ALL HAPPY AND WE CAN KEEP TRACKING THE LABELS.
         """
         Compute projection (Jacobian) for a node.
         
@@ -802,120 +803,6 @@ class BayesianTensorNetwork:
         else:
             return torch.tensor(float(result), device=self.device, dtype=self.dtype)
 
-    def compute_node_update_terms(
-        self,
-        node_tag: str,
-        inputs: Dict[str, torch.Tensor],
-        y: torch.Tensor,
-        E_tau: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute the precision matrix and RHS vector for block variational update.
-        
-        Implements the update formula:
-        Σ^{-1} = E[τ] * [Σ_n Σ_{other_out} J_σ(x_n) + Σ_n Σ_{other_out} J_μ(x_n) ⊗ J_μ(x_n)] + Θ
-        μ = Σ * E[τ] * Σ_n Σ_{other_out} y_n * J_μ(x_n)
-        
-        Where:
-        - J_σ(x_n) = projection of sigma network for sample n
-        - J_μ(x_n) = projection of mu network for sample n
-        - Sums are over samples AND output dimensions the block doesn't own
-        - Result is expanded over the block's own output dimensions
-        
-        Args:
-            node_tag: Tag of the node to update
-            inputs: Batched input data (batch_size, features)
-            y: Target data (batch_size, *output_dims)
-            E_tau: Expected value of precision τ
-            
-        Returns:
-            (precision_matrix, rhs_vector) where:
-            - precision_matrix: shape (d, d) where d = product of all node dimensions
-            - rhs_vector: shape (d,) 
-            Both are ready for linear system solve: Σ^{-1} μ = rhs
-        """
-        # Get node information
-        mu_tn = self.mu_network.mu_tn
-        mu_node = mu_tn[node_tag]  # type: ignore[index]
-        node_inds = mu_node.inds  # type: ignore[union-attr]
-        node_shape = mu_node.shape  # type: ignore[union-attr]
-        
-        # Separate variational vs output indices  
-        node_output_inds = [ind for ind in node_inds if ind in self.output_indices]
-        node_variational_inds = [ind for ind in node_inds if ind not in self.output_indices]
-        
-        # Calculate dimensions
-        d_var = int(torch.prod(torch.tensor([node_shape[list(node_inds).index(ind)] 
-                                             for ind in node_variational_inds])))
-        d_out = int(torch.prod(torch.tensor([node_shape[list(node_inds).index(ind)] 
-                                             for ind in node_output_inds]))) if node_output_inds else 1
-        d_total = d_var * d_out
-        
-        # Get projections
-        # Shape: (batch, *node_variational_inds, *other_output_inds)
-        proj_mu = self.compute_projection(node_tag, 'mu', inputs)
-        proj_sigma = self.compute_projection(node_tag, 'sigma', inputs)
-        
-        # Determine dimensions to sum over: batch + other output dimensions
-        n_var_dims = len(node_variational_inds)
-        dims_to_sum = [0] + list(range(1 + n_var_dims, proj_mu.dim()))
-        
-        # 1. Compute Σ_n Σ_{other_out} J_σ(x_n)
-        J_sigma_sum = proj_sigma.sum(dim=dims_to_sum)  # Shape: (*node_var_inds)
-        
-        # 2. Compute Σ_n Σ_{other_out} J_μ(x_n) ⊗ J_μ(x_n)
-        batch_size = proj_mu.shape[0]
-        
-        # Flatten variational dimensions
-        proj_mu_flat = proj_mu.reshape(batch_size, d_var, -1)  # (batch, d_var, n_other)
-        
-        # Outer product summed over batch and other outputs
-        J_mu_outer = torch.zeros(d_var, d_var, device=self.device, dtype=self.dtype)
-        for i in range(batch_size):
-            proj_i = proj_mu_flat[i]  # (d_var, n_other)
-            J_mu_outer += torch.mm(proj_i, proj_i.t())  # (d_var, d_var)
-        
-        # 3. Compute RHS: Σ_n Σ_{other_out} y_n * J_μ(x_n)
-        # Sum projection over samples and other outputs to get (*var_dims)
-        J_mu_sum = proj_mu.sum(dim=dims_to_sum)
-        
-        # For RHS, need to weight by y
-        # Simplified: sum y over all output dims per sample, then weight projections
-        rhs = torch.zeros(d_var, device=self.device, dtype=self.dtype)
-        for i in range(batch_size):
-            y_i_scalar = y[i].sum()  # Sum all output dimensions
-            # Sum proj_mu[i] over other output dimensions
-            proj_i_summed = proj_mu[i].sum(dim=list(range(n_var_dims, proj_mu[i].dim())))
-            rhs += y_i_scalar * proj_i_summed.flatten()
-        
-        # Now expand for node's output dimensions if needed
-        # J_sigma_sum: (*var_dims) → (d_var, d_var) matrix
-        # J_mu_outer: already (d_var, d_var)
-        
-        # Flatten J_sigma_sum properly - it represents a matrix in variational space
-        # Actually J_sigma from sigma network projection should already give us matrix structure
-        # But we summed it, so we have (*var_dims) - need to interpret as diagonal or full?
-        
-        # For now, treat as providing diagonal elements
-        J_sigma_matrix = torch.diag(J_sigma_sum.flatten())
-        
-        if d_out > 1:
-            # Expand using Kronecker product: repeat variational structure for each output dim
-            J_sigma_expanded = torch.kron(torch.eye(d_out, device=self.device, dtype=self.dtype), 
-                                          J_sigma_matrix)
-            J_mu_outer_expanded = torch.kron(torch.eye(d_out, device=self.device, dtype=self.dtype), 
-                                             J_mu_outer)
-            rhs_expanded = rhs.unsqueeze(1).expand(-1, d_out).flatten()
-        else:
-            J_sigma_expanded = J_sigma_matrix
-            J_mu_outer_expanded = J_mu_outer
-            rhs_expanded = rhs
-        
-        # Compute precision matrix (without theta - that's added externally)
-        precision = E_tau * (J_sigma_expanded + J_mu_outer_expanded)
-        rhs_final = E_tau * rhs_expanded
-        
-        return precision, rhs_final
 
     def _forward(self, tn: qtn.TensorNetwork, inputs: Dict[str, torch.Tensor], index_suffix: str) -> torch.Tensor:
         """
@@ -1132,9 +1019,11 @@ class BayesianTensorNetwork:
         
         # Compute Σ^{-1} = Θ + E[τ] * (sum_J_sigma + sum_J_mu_outer)
         # All tensors have shape (var_shape, var_shape) for variational dimensions only
-        sigma_inv_var = E_tau * (sum_J_sigma + sum_J_mu_outer) + theta
+        # TODO: here I am squeezing, but it is wrong! THETA IS BEING COMPUTED WITH OUTERDIMS_SHAPE, IT SHOULDNT, PLEASE LABEL AND USER QUIMB TENSORS
+        sigma_inv_var = E_tau * (sum_J_sigma + sum_J_mu_outer) + theta.squeeze()
         
         # Flatten only variational dims for Cholesky solve
+        # TODO: YOU NEED TO USE LABELS, TO DO SO YOU NEED TO HAVE ALL ALSO ENVIRONMENT AND ANY COMPUTATION TO BE QUIMB TENSORS, INHERITING THE LABELS. AND JUST MAKE THEM TORCH ONLY WHEN WE NEED TO DO OPERATIONS NOT PRESENT FOR QUIMB TENSORS.
         d_var = int(torch.prod(torch.tensor(var_shape)).item())
         sigma_inv_flat = sigma_inv_var.reshape(d_var, d_var)
         
@@ -1143,6 +1032,8 @@ class BayesianTensorNetwork:
         if node_out_shape:
             sum_y_J_mu_reshaped = sum_y_J_mu.reshape(d_var, *node_out_shape)
         else:
+            print('sum_y_J_mu', sum_y_J_mu.shape)
+            print('d_var', d_var)
             sum_y_J_mu_reshaped = sum_y_J_mu.reshape(d_var)
         
         # Compute Σ and μ - solve for each output element independently
@@ -1196,6 +1087,7 @@ class BayesianTensorNetwork:
         
         sigma_node_tag = node_tag + '_sigma'
         
+        # TODO: HEre too we need to operate with quimb nodes, it becomes way easyer to do all operations of summing and reshaping no?
         # Reshape covariance: (d, d) -> (d1, d2, ..., dn, d1, d2, ..., dn)
         extended_shape = var_shape + var_shape
         sigma_cov_reshaped = sigma_cov.reshape(extended_shape)
