@@ -103,9 +103,10 @@ class QuimbTensorNetwork:
             # Get bond dimension
             bond_dim = self._get_bond_dimension(bond)
             
-            # Initialize with weak prior: Gamma(1, 0.1)
+            # Initialize with weak prior: Gamma(1, 1)
+            # Using β=1.0 prevents over-regularization in complex topologies (Ring, Tree)
             alpha_0 = torch.ones(bond_dim, device=self.device, dtype=self.dtype)
-            beta_0 = torch.ones(bond_dim, device=self.device, dtype=self.dtype) * 0.1
+            beta_0 = torch.ones(bond_dim, device=self.device, dtype=self.dtype) * 1.0
             
             self.distributions[bond] = {
                 'alpha': alpha_0.clone(),
@@ -285,14 +286,20 @@ class QuimbTensorNetwork:
         return torch.tensor(data, device=self.device, dtype=self.dtype)
     
     def set_node_tensor(self, node_tag: str, data: torch.Tensor) -> None:
-        """Set tensor data for a node."""
-        data_np: np.ndarray
-        if isinstance(data, torch.Tensor):
-            data_np = data.detach().cpu().numpy()
-        else:
-            data_np = np.array(data)
+        """
+        Set tensor data for a node.
         
-        self.mu_tn[node_tag].modify(data=data_np)  # type: ignore
+        Keeps data in torch format (backend-agnostic, prefer torch).
+        """
+        # Keep torch tensors as torch (don't convert to numpy)
+        if isinstance(data, torch.Tensor):
+            tensor_data = data.detach()  # Detach from computation graph but keep as torch
+        elif isinstance(data, np.ndarray):
+            tensor_data = torch.from_numpy(data).to(device=self.device, dtype=self.dtype)
+        else:
+            tensor_data = torch.tensor(data, device=self.device, dtype=self.dtype)
+        
+        self.mu_tn[node_tag].modify(data=tensor_data)  # type: ignore
     
     def get_node_shape(self, node_tag: str) -> Tuple[int, ...]:
         """Get shape of a node tensor."""
