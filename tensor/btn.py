@@ -5,12 +5,16 @@ import numpy as np
 
 from tensor.builder import BTNBuilder
 
+# Tag for nodes that should not be trained
+NOT_TRAINABLE_TAG = "NT"
+
 class BTN:
     def __init__(self,
                  mu: qt.TensorNetwork,
                  output_dimensions: List[str],
                  batch_dim: str = "s",
-                 fixed_nodes: List[str] = None
+                 input_indices: List[str] = None,
+                 not_trainable_nodes: List[str] = None
                  ):
         """
         Bayesian Tensor Network.
@@ -19,12 +23,36 @@ class BTN:
             mu: The mean TensorNetwork topology.
             output_dimensions: List of output indices.
             batch_dim: Batch dimension label.
-            fixed_nodes: List of nodes that should not be optimized (optional).
+            input_indices: List of input indices (leaf nodes). If None, automatically detected.
+            not_trainable_nodes: List of node tags that should not be trained (e.g., input nodes).
+                                These nodes will be tagged with NOT_TRAINABLE_TAG ('NT').
         """
         self.mu = mu
         self.output_dimensions = output_dimensions
         self.batch_dim = batch_dim
-        self.fixed_nodes = fixed_nodes if fixed_nodes else []
+        
+        # Tag not trainable nodes with NT tag
+        not_trainable_nodes = not_trainable_nodes or []
+        for node_tag in not_trainable_nodes:
+            # Get tensor(s) with this tag and add NT tag
+            tensors = self.mu.select_tensors(node_tag, which='any')
+            for tensor in tensors:
+                tensor.add_tag(NOT_TRAINABLE_TAG)
+        
+        # Store the list of not trainable node tags
+        self.not_trainable_nodes = not_trainable_nodes
+        
+        # Determine input indices
+        if input_indices is not None:
+            self.input_indices = sorted(input_indices)
+        else:
+            # Auto-detect: input indices are leaf indices (appear only once)
+            ind_count = {}
+            for tensor in self.mu:
+                for ind in tensor.inds:
+                    if ind not in self.output_dimensions and ind != self.batch_dim:
+                        ind_count[ind] = ind_count.get(ind, 0) + 1
+            self.input_indices = sorted([ind for ind, count in ind_count.items() if count == 1])
 
         # --- Initialize Builder and Model Components ---
         self.builder = BTNBuilder(self.mu, self.output_dimensions, self.batch_dim)
@@ -109,120 +137,39 @@ class BTN:
                 
                 batch_results.append(res)
             
-            return self._concat_batch_results(batch_results)
 
-    def prepare_inputs(self, input_data: Dict[str, np.ndarray], for_sigma: bool = False) -> List[qt.Tensor]:
+    def prepare_inputs_for_sigma(self, input_data: Dict[str, any], for_sigma: bool = False) -> List[qt.Tensor]:
         """
-        Prepare input tensors for forward pass through the network.
+        Prepare inputs for the sigma network.
+        
+        For sigma, we need inputs for both regular and primed indices:
+        - Regular: same as mu inputs
+        - Primed: same data but with _prime suffix on indices
         
         Args:
-            input_data: Dictionary mapping input index names to data arrays.
-                       Two scenarios supported:
-                       1. Single input for all nodes: {'x1': array of shape (samples, features)}
-                          Creates identical input nodes x1, x2, ... with same data
-                       2. Separate inputs per node: {'x1': data_1, 'x2': data_2, ...}
-                          Each input index gets its own data
-            for_sigma: If True, doubles the inputs with '_prime' suffix for sigma network.
-                      If False, creates single copy for mu network.
+            input_data: Dictionary mapping input index names to data arrays
+            for_sigma: If True, returns inputs for both regular and primed indices
         
         Returns:
-            List of quimb.Tensor objects ready for forward pass.
-            
-        Example:
-            # Scenario 1: Same data for all input nodes
-            input_data = {'x1': np.random.randn(10, 4)}  # 10 samples, 4 features
-            mu_inputs = btn.prepare_inputs(input_data, for_sigma=False)
-            # Creates: x1(s, x1, data), x2(s, x2, data), ... with same data
-            
-            # Scenario 2: Different data per node
-            input_data = {'x1': data_1, 'x2': data_2}
-            mu_inputs = btn.prepare_inputs(input_data, for_sigma=False)
-            # Creates: x1(s, x1, data_1), x2(s, x2, data_2)
-            
-            # For sigma network (doubles inputs):
-            sigma_inputs = btn.prepare_inputs(input_data, for_sigma=True)
-            # Creates: x1(s, x1, data), x1_prime(s, x1_prime, data), x2(s, x2, data), x2_prime(s, x2_prime, data)
+            List of input tensors (regular + primed if for_sigma=True)
         """
-        # Identify input indices from the mu network
-        # Input indices are "leaf" indices that appear in only one tensor
-        # (not internal bonds that connect two tensors)
-        ind_count = {}
-        for tensor in self.mu:
-            for ind in tensor.inds:
-                if ind not in self.output_dimensions and ind != self.batch_dim:
-                    ind_count[ind] = ind_count.get(ind, 0) + 1
+        # Get regular inputs
+        regular_inputs = self.prepare_inputs(input_data)
         
-        # Input indices are those that appear only once (leaf nodes)
-        input_indices = sorted([ind for ind, count in ind_count.items() if count == 1])
+        if not for_sigma:
+            return regular_inputs
         
-        # Determine if we have single input for all or separate inputs
-        if len(input_data) == 1:
-            # Scenario 1: Single input data for all input nodes
-            single_key = list(input_data.keys())[0]
-            data = input_data[single_key]
-            
-            # Ensure data is at least 2D (samples, features)
-            if data.ndim == 1:
-                data = data.reshape(-1, 1)
-            
-            batch_size, feature_dim = data.shape
-            
-            # Create tensors for each input index pointing to the SAME data
-            tensors = []
-            for input_idx in input_indices:
-                # Create tensor with indices (batch_dim, input_idx)
-                # All tensors point to the same data object - no copy needed
-                tensor = qt.Tensor(
-                    data=data,
-                    inds=(self.batch_dim, input_idx),
-                    tags={f'input_{input_idx}'}
-                )
-                tensors.append(tensor)
-                
-                # If for_sigma, also create the prime version
-                if for_sigma:
-                    prime_idx = f"{input_idx}_prime"
-                    tensor_prime = qt.Tensor(
-                        data=data,  # Points to same data
-                        inds=(self.batch_dim, prime_idx),
-                        tags={f'input_{prime_idx}'}
-                    )
-                    tensors.append(tensor_prime)
-        else:
-            # Scenario 2: Separate data for each input index
-            tensors = []
-            for input_idx in input_indices:
-                if input_idx not in input_data:
-                    raise ValueError(f"Missing data for input index '{input_idx}'. "
-                                   f"Provided: {list(input_data.keys())}, Required: {input_indices}")
-                
-                data = input_data[input_idx]
-                
-                # Ensure data is at least 2D (samples, features)
-                if data.ndim == 1:
-                    data = data.reshape(-1, 1)
-                
-                # Create tensor with indices (batch_dim, input_idx)
-                tensor = qt.Tensor(
-                    data=data,
-                    inds=(self.batch_dim, input_idx),
-                    tags={f'input_{input_idx}'}
-                )
-                tensors.append(tensor)
-                
-                # If for_sigma, also create the prime version with the same data
-                if for_sigma:
-                    prime_idx = f"{input_idx}_prime"
-                    tensor_prime = qt.Tensor(
-                        data=data,  # Points to same data
-                        inds=(self.batch_dim, prime_idx),
-                        tags={f'input_{prime_idx}'}
-                    )
-                    tensors.append(tensor_prime)
+        # Create primed versions
+        primed_inputs = []
+        for inp in regular_inputs:
+            # Prime all indices except batch_dim
+            primed_inp = self.prime_indices_tensor(inp, exclude_indices=[self.batch_dim])
+            primed_inputs.append(primed_inp)
         
-        return tensors
+        # Return both regular and primed
+        return regular_inputs + primed_inputs
 
-    def get_environment(self, tn: qt.TensorNetwork, target_tag: str, copy: bool = True,
+    def _batch_environment(self, tn: qt.TensorNetwork, target_tag: str, copy: bool = True,
                         sum_over_batch: bool = False, sum_over_output: bool = False) -> qt.Tensor:
         """
         Calculates the environment for a target tensor (single batch).
@@ -261,8 +208,11 @@ class BTN:
             for out_dim in self.output_dimensions:
                 if out_dim in final_env_inds:
                     final_env_inds.remove(out_dim)
-        
-        # If batch dimension is not in outer_inds but exists and we want to keep it
+
+        # Special case: batch dimension might not be in outer_inds if it's shared
+        # between multiple tensors (appears in more than one tensor in the environment).
+        # This happens when input tensors all share the batch dimension.
+        # In this case, we need to explicitly add it to preserve it.
         if not sum_over_batch and self.batch_dim not in final_env_inds:
             # Check if batch dim exists in the environment
             all_inds_in_env = set()
@@ -270,7 +220,7 @@ class BTN:
                 all_inds_in_env.update(tensor.inds)
             
             if self.batch_dim in all_inds_in_env:
-                # Batch dim exists but is shared - preserve it
+                # Batch dim exists but is shared (not outer) - we need to preserve it
                 final_env_inds = [self.batch_dim] + final_env_inds
 
         # 3. Contract
@@ -305,7 +255,7 @@ class BTN:
                 tn_with_inputs = tn_base & batch_inputs
                 
                 # Get environment for this batch
-                env = self.get_environment(tn_with_inputs, target_tag, copy=copy,
+                env = self._batch_environment(tn_with_inputs, target_tag, copy=copy,
                                           sum_over_batch=sum_over_batch, 
                                           sum_over_output=sum_over_output)
                 
@@ -324,7 +274,7 @@ class BTN:
                 tn_with_inputs = tn_base & batch_inputs
                 
                 # Get environment for this batch
-                env = self.get_environment(tn_with_inputs, target_tag, copy=copy,
+                env = self._batch_environment(tn_with_inputs, target_tag, copy=copy,
                                           sum_over_batch=sum_over_batch, 
                                           sum_over_output=sum_over_output)
                 batch_envs.append(env)
@@ -426,36 +376,265 @@ class BTN:
                 raise NotImplementedError(f"Concatenation not implemented for backend: {type(first_data)}")
         
         return qt.Tensor(concat_data, inds=first_result.inds)
-    
-    def _sum_batch_results(self, batch_results: List):
+
+    def _sum_over_batches(self, 
+                         batch_operation,
+                         inputs: any,
+                         *args, 
+                         **kwargs) -> qt.Tensor:
         """
-        Sum batch results using quimb addition.
+        Generic method to apply a batch operation and sum results over all batches.
+        
+        This avoids storing all batch results in memory - sums on-the-fly.
         
         Args:
-            batch_results: List of tensors or scalars from each batch
-            
+            batch_operation: Function that takes (batch_idx, inputs, *args, **kwargs)
+                           and returns a tensor for that batch
+            inputs: Input data prepared with prepare_inputs (list of tensors)
+            *args, **kwargs: Additional arguments to pass to batch_operation
+        
         Returns:
-            Summed result (qt.Tensor or scalar)
+            Sum of all batch results
+            
+        Example:
+            def my_batch_op(batch_idx, inputs):
+                return self._batch_environment(..., batch_idx, ...)
+            
+            result = self._sum_over_batches(my_batch_op, inputs)
         """
-        if len(batch_results) == 0:
-            raise ValueError("No batch results to sum")
+        result = None
         
-        if len(batch_results) == 1:
-            return batch_results[0]
+        # inputs is a list of tensors, get batch size from first one
+        num_batches = inputs[0].shape[0]
         
-        # Start with first result
-        result = batch_results[0]
-        
-        # Check if scalar
-        if not isinstance(result, qt.Tensor):
-            # Scalar - just use + operator
-            for t in batch_results[1:]:
-                result = result + t
-            return result
-        
-        # Tensor - use quimb addition (element-wise)
-        result = result.copy()
-        for t in batch_results[1:]:
-            result = result + t
+        # Iterate over batches
+        for batch_idx in range(num_batches):
+            # Compute for this batch
+            batch_result = batch_operation(batch_idx, inputs, *args, **kwargs)
+            
+            # Sum into accumulator
+            if result is None:
+                result = batch_result
+            else:
+                result = result + batch_result
         
         return result
+
+    def theta_block_computation(self, 
+                                node_tag: str,
+                                exclude_bonds: Optional[List[str]] = None) -> qt.Tensor:
+        """
+        Compute theta^B(i) for a given node: the outer product of expected bond probabilities.
+        
+        From theoretical model:
+            θ^B(i) = ⊗_{b ∈ B(i)} E[λ_b]  where E[λ] = α/β
+        
+        This creates a tensor representing the expectation of the bond variables (precisions)
+        connected to a specific node, excluding output dimensions and optionally other bonds.
+        
+        Args:
+            node_tag: Tag identifying the node in the tensor network
+            exclude_bonds: Optional list of bond indices (labels) to exclude from computation.
+                          Output dimensions and batch_dim are always excluded.
+        
+        Returns:
+            quimb.Tensor with shape matching the node's shape minus excluded dimensions.
+            Acts as a diagonal matrix when used in linear algebra operations.
+            
+        Example:
+            # Node has indices ['a', 'b', 'c', 'out'] with shapes [2, 3, 4, 5]
+            # Output dimensions = ['out'], batch_dim = 's'
+            # theta = btn.theta_block_computation('node1')
+            # Result has indices ['a', 'b', 'c'] with shapes [2, 3, 4]
+            # Data is outer product: E[λ_a] ⊗ E[λ_b] ⊗ E[λ_c]
+        """
+        exclude_bonds = exclude_bonds or []
+        
+        # Get the node tensor from mu network
+        node = self.mu[node_tag]
+        excluded_indices = self.output_dimensions + [self.batch_dim] + exclude_bonds 
+        
+        # Identify bond indices: all indices except output dims, batch dim, and excluded
+        bond_indices = [
+            ind for ind in node.inds 
+            if ind not in excluded_indices 
+        ]
+        
+        if len(bond_indices) == 0:
+            raise ValueError(f"Node {node_tag} has no bond indices after exclusions")
+        
+        # Get expected values E[λ] = α/β for each bond from q_bonds (posterior)
+        # These are quimb.Tensor objects with their respective indices
+        bond_means = [self.q_bonds[bond_ind].mean() for bond_ind in bond_indices]
+        
+        # Create TensorNetwork directly from list of tensors
+        theta_tn = qt.TensorNetwork(bond_means)
+        
+        # Contract to get the outer product (preserves all indices and labels)
+        theta = theta_tn.contract()
+        
+        return theta
+
+    def count_trainable_nodes_on_bond(self, bond_ind: str) -> int:
+        """
+        Count how many trainable nodes share a given bond.
+        
+        A trainable node is one that does NOT have the NOT_TRAINABLE_TAG ('NT').
+        
+        Args:
+            bond_ind: The bond index (label) to check
+        
+        Returns:
+            Number of trainable nodes that have this bond index
+            
+        Example:
+            # Bond 'a' is shared by node1 (trainable), node2 (trainable), and input (not trainable)
+            # count_trainable_nodes_on_bond('a') returns 2
+        """
+        # Get tensor IDs that have this bond index using ind_map
+        tids_with_bond = self.mu.ind_map.get(bond_ind, set())
+        
+        # Count those that are trainable (don't have NT tag)
+        trainable_count = sum(
+            1 for tid in tids_with_bond 
+            if NOT_TRAINABLE_TAG not in self.mu.tensor_map[tid].tags
+        )
+        
+        return trainable_count
+
+    def prime_indices(self, 
+                      node_tag: str, 
+                      exclude_indices: Optional[List[str]] = None,
+                      prime_suffix: str = "_prime") -> qt.Tensor:
+        """
+        Create a copy of a node tensor with all indices (except excluded ones) relabeled 
+        by appending a suffix.
+        
+        This is useful for creating 'primed' versions of tensors for operations like
+        computing overlaps or conjugate networks.
+        
+        Args:
+            node_tag: Tag identifying the node in the tensor network
+            exclude_indices: List of index labels to NOT relabel. 
+                           If None, no indices are excluded.
+            prime_suffix: Suffix to append to relabeled indices (default: "_prime")
+        
+        Returns:
+            New quimb.Tensor with relabeled indices (not inplace)
+            
+        Example:
+            # Node has indices ('a', 'b', 'c', 'out')
+            # prime_indices('node1', exclude_indices=['out'])
+            # Returns tensor with indices ('a_prime', 'b_prime', 'c_prime', 'out')
+        """
+        exclude_indices = exclude_indices or []
+        
+        # Get the node tensor
+        node = self.mu[node_tag]
+        
+        # Build reindex map: {old_ind: new_ind} for non-excluded indices
+        reindex_map = {
+            ind: f"{ind}{prime_suffix}"
+            for ind in node.inds
+            if ind not in exclude_indices
+        }
+        
+        # Reindex returns a new tensor (inplace=False by default)
+        primed_node = node.reindex(reindex_map)
+        
+        return primed_node
+
+    def compute_precision_node(self,
+                                   node_tag: str,
+                                   inputs: any) -> qt.Tensor:
+
+        tau_expectation = None
+        sigma_env = None
+        mu_outer_env = None
+        theta = None
+        original_inds = theta.inds # Get a copy of indices to iterate over
+
+        for old_ind in original_inds:
+            primed_ind = old_ind + '_prime'
+
+            # Expand the original index into the desired diagonal pair
+            # The original values are placed along the diagonal of (old_ind, primed_ind)
+            theta = theta.new_ind_pair_diag(old_ind, old_ind, primed_ind)
+        precision = tau_expectation * (sigma_env + mu_outer_env) + theta
+        return
+
+    def compute_environment_outer(self,
+                                   node_tag: str,
+                                   inputs: any) -> qt.Tensor:
+        """
+        Compute the outer product of mu environment with itself, summed over batches:
+        Σ_n (T_i μ x_n) ⊗ (T_i μ x_n)
+        
+        This is used in computing the precision update for variational inference.
+        The environment is computed batch-by-batch, outer product computed, then summed.
+        
+        From theoretical model (Step 1, node update):
+            Part of Σ⁻¹ computation requires: Σ_n (T_i μ x_n) ⊗ (T_i μ x_n)
+        
+        Args:
+            node_tag: Tag identifying the node to exclude from environment
+            inputs: Input data prepared with prepare_inputs (list of tensors with batch dim)
+        
+        Returns:
+            Tensor representing Σ_n (T_i μ x_n) ⊗ (T_i μ x_n), with indices being
+            the bonds of the node and their primed versions.
+            Shape: (bond_a, bond_b, ..., bond_a_prime, bond_b_prime, ...)
+        """
+        def batch_outer_operation(batch_idx, inputs):
+            # Contract mu network with ALL inputs (they have batch dimension)
+            tn_with_inputs = self.mu & inputs
+            
+            # Get environment for this batch (using the tag from mu network)
+            env = self._batch_environment(
+                tn_with_inputs,
+                node_tag,
+                sum_over_batch=False,  # Keep batch dim, will select batch_idx
+                sum_over_output=False  # Keep output dim for now
+            )
+            
+            # Select the specific batch (env has batch_dim 's')
+            # Extract just this batch from the environment
+            env_single = env.isel({self.batch_dim: batch_idx})
+            
+            # Prime indices (exclude output)
+            env_prime = self.prime_indices_tensor(env_single, exclude_indices=self.output_dimensions)
+            
+            # Outer product via tensor network (sums over shared output indices)
+            outer_tn = env_single & env_prime
+            batch_result = outer_tn.contract()
+            
+            return batch_result
+        
+        # Use generic batch summing
+        return self._sum_over_batches(batch_outer_operation, inputs)
+    
+    def prime_indices_tensor(self, 
+                            tensor: qt.Tensor,
+                            exclude_indices: Optional[List[str]] = None,
+                            prime_suffix: str = "_prime") -> qt.Tensor:
+        """
+        Helper to prime indices of any tensor (not just from network).
+        
+        Args:
+            tensor: The tensor to prime
+            exclude_indices: Indices to NOT prime
+            prime_suffix: Suffix to add (default "_prime")
+        
+        Returns:
+            New tensor with primed indices
+        """
+        exclude_indices = exclude_indices or []
+        
+        reindex_map = {
+            ind: f"{ind}{prime_suffix}"
+            for ind in tensor.inds
+            if ind not in exclude_indices
+        }
+        
+        return tensor.reindex(reindex_map)
+  

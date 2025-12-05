@@ -63,17 +63,17 @@ def main():
     full_tn_no_y = mu_tn & inputs_mu
     
     print("\n--- T1 Environment (no y) ---")
-    env_t1_no_y = btn.get_environment(full_tn_no_y, 'T1', copy=True, 
+    env_t1_no_y = btn._batch_environment(full_tn_no_y, 'T1', copy=True, 
                                       sum_over_batch=False, sum_over_output=False)
     print_result(env_t1_no_y, "Environment T1 (no y, keep batch, keep output)")
     
     print("\n--- T1 Environment (no y, sum_over_batch=True) ---")
-    env_t1_no_y_sumb = btn.get_environment(full_tn_no_y, 'T1', copy=True,
+    env_t1_no_y_sumb = btn._batch_environment(full_tn_no_y, 'T1', copy=True,
                                             sum_over_batch=True, sum_over_output=False)
     print_result(env_t1_no_y_sumb, "Environment T1 (no y, sum batch, keep output)")
     
     print("\n--- T1 Environment (no y, sum_over_output=True) ---")
-    env_t1_no_y_sumo = btn.get_environment(full_tn_no_y, 'T1', copy=True,
+    env_t1_no_y_sumo = btn._batch_environment(full_tn_no_y, 'T1', copy=True,
                                             sum_over_batch=False, sum_over_output=True)
     print_result(env_t1_no_y_sumo, "Environment T1 (no y, keep batch, sum output)")
     
@@ -89,7 +89,7 @@ def main():
     print(f"  {full_tn_with_y.outer_inds()}")
     
     print("\n--- T1 Environment (with y) ---")
-    env_t1_with_y = btn.get_environment(full_tn_with_y, 'T1', copy=True,
+    env_t1_with_y = btn._batch_environment(full_tn_with_y, 'T1', copy=True,
                                         sum_over_batch=False, sum_over_output=False)
     print_result(env_t1_with_y, "Environment T1 (with y, keep batch, keep output)")
     
@@ -99,7 +99,7 @@ def main():
     print(f"  --> When y is added, output dims (y1, y2) are contracted!")
     
     print("\n--- T1 Environment (with y, sum_over_batch=True) ---")
-    env_t1_with_y_sumb = btn.get_environment(full_tn_with_y, 'T1', copy=True,
+    env_t1_with_y_sumb = btn._batch_environment(full_tn_with_y, 'T1', copy=True,
                                               sum_over_batch=True, sum_over_output=False)
     print_result(env_t1_with_y_sumb, "Environment T1 (with y, sum batch, keep output)")
     
@@ -108,7 +108,7 @@ def main():
     print(f"  WITH y (sum batch):    {env_t1_with_y_sumb.inds}")
     
     print("\n--- T1 Environment (with y, sum_over_output=True) ---")
-    env_t1_with_y_sumo = btn.get_environment(full_tn_with_y, 'T1', copy=True,
+    env_t1_with_y_sumo = btn._batch_environment(full_tn_with_y, 'T1', copy=True,
                                               sum_over_batch=False, sum_over_output=True)
     print_result(env_t1_with_y_sumo, "Environment T1 (with y, keep batch, sum output)")
     
@@ -132,7 +132,7 @@ def main():
     full_sigma_no_y = btn.sigma & inputs_sigma
     
     print("\n--- T1_sigma Environment (no y) ---")
-    env_sigma_no_y = btn.get_environment(full_sigma_no_y, 'T1_sigma', copy=True,
+    env_sigma_no_y = btn._batch_environment(full_sigma_no_y, 'T1_sigma', copy=True,
                                          sum_over_batch=False, sum_over_output=False)
     print_result(env_sigma_no_y, "SIGMA Environment T1 (no y)")
     
@@ -140,7 +140,7 @@ def main():
     full_sigma_with_y = btn.sigma & inputs_sigma & y
     
     print("\n--- T1_sigma Environment (with y) ---")
-    env_sigma_with_y = btn.get_environment(full_sigma_with_y, 'T1_sigma', copy=True,
+    env_sigma_with_y = btn._batch_environment(full_sigma_with_y, 'T1_sigma', copy=True,
                                            sum_over_batch=False, sum_over_output=False)
     print_result(env_sigma_with_y, "SIGMA Environment T1 (with y)")
     
@@ -155,7 +155,7 @@ def main():
     print(f"  Prime indices WITH y: {prime_inds_with_y}")
     
     print("\n--- T1_sigma Environment (with y, sum_over_batch=True) ---")
-    env_sigma_with_y_sumb = btn.get_environment(full_sigma_with_y, 'T1_sigma', copy=True,
+    env_sigma_with_y_sumb = btn._batch_environment(full_sigma_with_y, 'T1_sigma', copy=True,
                                                  sum_over_batch=True, sum_over_output=False)
     print_result(env_sigma_with_y_sumb, "SIGMA Environment T1 (with y, sum batch)")
     

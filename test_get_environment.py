@@ -71,7 +71,7 @@ def main():
     
     # Test environment for T2
     print("\n--- Computing environment for T2 (removing T2) ---")
-    env_t2 = btn.get_environment(full_mu_tn, 'T2', copy=True)
+    env_t2 = btn._batch_environment(full_mu_tn, 'T2', copy=True)
     
     inspect_tensor(env_t2, "Environment Tensor for T2")
     
@@ -110,7 +110,7 @@ def main():
     
     # Test environment for T2_sigma
     print("\n--- Computing environment for T2_sigma (removing T2_sigma) ---")
-    env_t2_sigma = btn.get_environment(full_sigma_tn, 'T2_sigma', copy=True)
+    env_t2_sigma = btn._batch_environment(full_sigma_tn, 'T2_sigma', copy=True)
     
     inspect_tensor(env_t2_sigma, "Environment Tensor for T2_sigma")
     
@@ -152,7 +152,7 @@ def main():
         batch_full_tn = mu_tn & batch_mu_inputs
         
         # Compute environment for T1
-        env_t1 = btn.get_environment(batch_full_tn, 'T1', copy=True)
+        env_t1 = btn._batch_environment(batch_full_tn, 'T1', copy=True)
         
         print(f"Environment indices: {env_t1.inds}")
         print(f"Environment shape: {env_t1.data.shape}")
@@ -195,7 +195,7 @@ def main():
         batch_full_sigma_tn = btn.sigma & batch_sigma_inputs
         
         # Compute environment for T3_sigma
-        env_t3_sigma = btn.get_environment(batch_full_sigma_tn, 'T3_sigma', copy=True)
+        env_t3_sigma = btn._batch_environment(batch_full_sigma_tn, 'T3_sigma', copy=True)
         
         print(f"Environment indices: {env_t3_sigma.inds}")
         print(f"Environment shape: {env_t3_sigma.data.shape}")
@@ -231,7 +231,7 @@ def main():
     nodes_to_test = ['T1', 'T2', 'T3']
     
     for node_tag in nodes_to_test:
-        env = btn.get_environment(test_full_tn, node_tag, copy=True)
+        env = btn._batch_environment(test_full_tn, node_tag, copy=True)
         print(f"\n{node_tag}:")
         print(f"  Environment indices: {env.inds}")
         print(f"  Environment shape: {env.data.shape}")
@@ -253,7 +253,7 @@ def main():
     sigma_nodes_to_test = ['T1_sigma', 'T2_sigma', 'T3_sigma']
     
     for node_tag in sigma_nodes_to_test:
-        env = btn.get_environment(test_full_sigma_tn, node_tag, copy=True)
+        env = btn._batch_environment(test_full_sigma_tn, node_tag, copy=True)
         print(f"\n{node_tag}:")
         print(f"  Environment indices: {env.inds}")
         print(f"  Environment shape: {env.data.shape}")

@@ -49,7 +49,7 @@ def run_test():
 
         # 4A. Test 1: Dynamic Environment (TN + Inputs -> Env)
         # Check if Env * Target reproduces the forward pass
-        env_dynamic = model.get_environment(tn_with_inputs, tag)
+        env_dynamic = model._batch_environment(tn_with_inputs, tag)
         
         # Check if the environment tensor contains the batch dim 's'
         has_s_dim = model.batch_dim in env_dynamic.inds
@@ -69,7 +69,7 @@ def run_test():
         # Check if (Env * Target) + Inputs reproduces the forward pass
         
         # 1. Get Environment of the model without inputs (Pure weights)
-        env_static = model.get_environment(model_tn, tag)
+        env_static = model._batch_environment(model_tn, tag)
         
         # Check if the environment tensor contains the open input index 'x2' (for T1/T3) or 'x1' (for T2/T3)
         # This confirms the fix worked: the input legs are now open.

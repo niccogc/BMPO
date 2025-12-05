@@ -84,22 +84,22 @@ def main():
     full_tn = mu_tn & inputs
     
     print("\n--- Case 1: sum_over_batch=False, sum_over_output=False ---")
-    env1 = btn.get_environment(full_tn, 'T1', copy=True, 
+    env1 = btn._batch_environment(full_tn, 'T1', copy=True, 
                                sum_over_batch=False, sum_over_output=False)
     print_result(env1, "ENVIRONMENT T1 (keep batch, keep output)")
     
     print("\n--- Case 2: sum_over_batch=True, sum_over_output=False ---")
-    env2 = btn.get_environment(full_tn, 'T1', copy=True,
+    env2 = btn._batch_environment(full_tn, 'T1', copy=True,
                                sum_over_batch=True, sum_over_output=False)
     print_result(env2, "ENVIRONMENT T1 (sum batch, keep output)")
     
     print("\n--- Case 3: sum_over_batch=False, sum_over_output=True ---")
-    env3 = btn.get_environment(full_tn, 'T1', copy=True,
+    env3 = btn._batch_environment(full_tn, 'T1', copy=True,
                                sum_over_batch=False, sum_over_output=True)
     print_result(env3, "ENVIRONMENT T1 (keep batch, sum output)")
     
     print("\n--- Case 4: sum_over_batch=True, sum_over_output=True ---")
-    env4 = btn.get_environment(full_tn, 'T1', copy=True,
+    env4 = btn._batch_environment(full_tn, 'T1', copy=True,
                                sum_over_batch=True, sum_over_output=True)
     print_result(env4, "ENVIRONMENT T1 (sum batch, sum output)")
     
@@ -109,12 +109,12 @@ def main():
     print("="*70)
     
     print("\n--- Case 1: sum_over_batch=False, sum_over_output=False ---")
-    env_t2_1 = btn.get_environment(full_tn, 'T2', copy=True,
+    env_t2_1 = btn._batch_environment(full_tn, 'T2', copy=True,
                                     sum_over_batch=False, sum_over_output=False)
     print_result(env_t2_1, "ENVIRONMENT T2 (keep batch, keep output)")
     
     print("\n--- Case 2: sum_over_batch=True, sum_over_output=False ---")
-    env_t2_2 = btn.get_environment(full_tn, 'T2', copy=True,
+    env_t2_2 = btn._batch_environment(full_tn, 'T2', copy=True,
                                     sum_over_batch=True, sum_over_output=False)
     print_result(env_t2_2, "ENVIRONMENT T2 (sum batch, keep output)")
     

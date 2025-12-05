@@ -176,7 +176,7 @@ def main():
     manual_env_sum = None
     for batch_inputs in input_batches:
         full_tn = mu_tn & batch_inputs
-        env = btn.get_environment(full_tn, 'T1', sum_over_batch=True, sum_over_output=False)
+        env = btn._batch_environment(full_tn, 'T1', sum_over_batch=True, sum_over_output=False)
         if manual_env_sum is None:
             manual_env_sum = env
         else:

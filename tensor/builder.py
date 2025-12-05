@@ -10,6 +10,157 @@ from tensor.distributions import (
     ProductDistribution
 )
 
+class Inputs:
+    """
+        input is a list of lenght number of batches, where there is a dictionary of what the inputs are connecting for and which labels TODO: make a method that batches and labels auto.
+    """
+    def __init__(self, input: List[any], outputs: List[any], outputs_labels: List[str],input_labels: List[str], batch_dim: str = "s"):
+        self.batch_dim = batch_dim
+        self.repeated = len(list) == 1
+        self.outputs_labels = outputs_labels
+        self.input_labels = input_labels if not self.repeatd else ["dummy_label"]
+        print("It is assumed that the Inputs and outputs in list are ordered as labels")
+        
+    def batch_splits(self, xs, y, B):
+        s = y.shape[0]
+        for i in range(0, s, B):
+            tensor = qt.Tensor(
+                data=y[i:i+B],
+                inds=(self.batch_dim, *self.outputs_labels),
+                tags={'output'}
+            )
+            batch ={f"{j}": x[i:i+B] for j, x in zip(self.input_labels,xs)} 
+            yield batch, tensor
+
+    def create_node_from_batch_splits(self, batches):
+        for b in batches:
+            if self.repeated:
+                mubatch, sigmabatch = self.prepare_inputs_batch_repeated(b)
+            else:
+                mubatch, sigmabatch = self.prepare_inputs_batch(b)
+            yield mubatch, sigmabatch
+
+    def create_nodes():
+        pass
+
+    def prepare_inputs_batch(self, input_data: Dict[str, any]) -> List[qt.Tensor]:
+        """
+        Prepare input tensors for forward pass through the network.
+        
+        Args:
+            input_data: Dictionary mapping input index names to data arrays (numpy, torch, jax).
+                       Two scenarios supported:
+                       1. Single input for all nodes: {'x1': array of shape (samples, features)}
+                          Creates identical input nodes x1, x2, ... with same data
+                       2. Separate inputs per node: {'x1': data_1, 'x2': data_2, ...}
+                          Each input index gets its own data
+            for_sigma: If True, doubles the inputs with '_prime' suffix for sigma network.
+                      If False, creates single copy for mu network.
+        
+        Returns:
+            List of quimb.Tensor objects ready for forward pass.
+            
+        Example:
+            # Scenario 2: Different data per node
+            input_data = {'x1': data_1, 'x2': data_2}
+            mu_inputs = btn.prepare_inputs(input_data, for_sigma=False)
+            # Creates: x1(s, x1, data_1), x2(s, x2, data_2)
+            
+            # For sigma network (doubles inputs):
+            sigma_inputs = btn.prepare_inputs(input_data, for_sigma=True)
+            # Creates: x1(s, x1, data), x1_prime(s, x1_prime, data), x2(s, x2, data), x2_prime(s, x2_prime, data)
+        """
+        # Use input_indices from class (either provided or auto-detected in __init__)
+        tensors = []
+        for k,v in input_data.items():
+            
+            # Assert correct shape (must be 2D: batch x features)
+            assert v.ndim == 2, f"Input data for '{k}' must be 2D (batch_size, features), got shape {v.shape}"
+            
+            # Create tensor with indices (batch_dim, input_idx)
+            tensor = qt.Tensor(
+                data=v,
+                inds=(self.batch_dim, k),
+                tags={f'input_{k}'}
+            )
+            tensors.append(tensor)
+            mu_inputs = tensors.copy()
+            # If for_sigma, also create the prime version with the same data
+            prime_idx = f"{k}_prime"
+            tensor_prime = qt.Tensor(
+                data=v,  # Points to same data
+                inds=(self.batch_dim, prime_idx),
+                tags={f'input_{prime_idx}'}
+            )
+            tensors.append(tensor_prime)
+            sigma_inputs = tensors.copy()
+        
+        return mu_inputs, sigma_inputs
+
+    def prepare_inputs_batch_repeated(self, input_data: Dict[str, any]) -> List[qt.Tensor]:
+        """
+        Prepare input tensors for forward pass through the network.
+        
+        Args:
+            input_data: Dictionary mapping input index names to data arrays (numpy, torch, jax).
+                       Two scenarios supported:
+                       1. Single input for all nodes: {'x1': array of shape (samples, features)}
+                          Creates identical input nodes x1, x2, ... with same data
+                       2. Separate inputs per node: {'x1': data_1, 'x2': data_2, ...}
+                          Each input index gets its own data
+            for_sigma: If True, doubles the inputs with '_prime' suffix for sigma network.
+                      If False, creates single copy for mu network.
+        
+        Returns:
+            List of quimb.Tensor objects ready for forward pass.
+            
+        Example:
+            # Scenario 1: Same data for all input nodes
+            input_data = {'x1': np.random.randn(10, 4)}  # 10 samples, 4 features
+            mu_inputs = btn.prepare_inputs(input_data, for_sigma=False)
+            # Creates: x1(s, x1, data), x2(s, x2, data), ... with same data
+            # For sigma network (doubles inputs):
+            sigma_inputs = btn.prepare_inputs(input_data, for_sigma=True)
+            # Creates: x1(s, x1, data), x1_prime(s, x1_prime, data), x2(s, x2, data), x2_prime(s, x2_prime, data)
+        """
+        # Use input_indices from class (either provided or auto-detected in __init__)
+        # Determine if we have single input for all or separate inputs
+        # Scenario 1: Single input data for all input nodes
+
+        input_indices = self.input_labels
+        single_key = list(input_data.keys())[0]
+        data = input_data[single_key]
+        
+        # Assert correct shape (must be 2D: batch x features)
+        assert data.ndim == 2, f"Input data must be 2D (batch_size, features), got shape {data.shape}"
+        
+        batch_size, feature_dim = data.shape
+        
+        # Create tensors for each input index pointing to the SAME data
+        tensors = []
+        for input_idx in input_indices:
+            # Create tensor with indices (batch_dim, input_idx)
+            # All tensors point to the same data object - no copy needed
+            tensor = qt.Tensor(
+                data=data,
+                inds=(self.batch_dim, input_idx),
+                tags={f'input_{input_idx}'}
+            )
+            tensors.append(tensor)
+            
+            mu_inputs = tensors.copy()
+            # If for_sigma, also create the prime version
+            prime_idx = f"{input_idx}_prime"
+            tensor_prime = qt.Tensor(
+                data=data,  # Points to same data
+                inds=(self.batch_dim, prime_idx),
+                tags={f'input_{prime_idx}'}
+            )
+            tensors.append(tensor_prime)
+            sigma_inputs = tensors.copy()
+       
+        return mu_inputs, sigma_inputs
+        
 class BTNBuilder:
     """
     Builder class for constructing the Bayesian Tensor Network components.

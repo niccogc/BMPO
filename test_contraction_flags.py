@@ -115,27 +115,27 @@ def main():
     full_tn = mu_tn & single_batch_inputs
 
     print("\n--- 2A: Default Environment (sum_over_batch=False, sum_over_output=False) ---")
-    env_t1_default = btn.get_environment(full_tn, 'T1', copy=True, 
+    env_t1_default = btn._batch_environment(full_tn, 'T1', copy=True, 
                                          sum_over_batch=False, sum_over_output=False)
     inspect_result(env_t1_default, "Default Environment for T1")
     assert batch_dim in env_t1_default.inds, "Batch dimension should be present"
     print(f"✅ Default environment: batch dimension preserved")
 
     print("\n--- 2B: Environment with sum_over_batch=True ---")
-    env_t1_sum_batch = btn.get_environment(full_tn, 'T1', copy=True,
+    env_t1_sum_batch = btn._batch_environment(full_tn, 'T1', copy=True,
                                            sum_over_batch=True, sum_over_output=False)
     inspect_result(env_t1_sum_batch, "Environment (sum over batch)")
     assert batch_dim not in env_t1_sum_batch.inds, "Batch dimension should be contracted"
     print(f"✅ Sum over batch: batch dimension contracted")
 
     print("\n--- 2C: Environment with sum_over_output=True ---")
-    env_t1_sum_output = btn.get_environment(full_tn, 'T1', copy=True,
+    env_t1_sum_output = btn._batch_environment(full_tn, 'T1', copy=True,
                                             sum_over_batch=False, sum_over_output=True)
     inspect_result(env_t1_sum_output, "Environment (sum over output)")
     print(f"⚠️  Note: sum_over_output=True contracts all indices")
 
     print("\n--- 2D: Environment with both flags True ---")
-    env_t1_sum_both = btn.get_environment(full_tn, 'T1', copy=True,
+    env_t1_sum_both = btn._batch_environment(full_tn, 'T1', copy=True,
                                           sum_over_batch=True, sum_over_output=True)
     inspect_result(env_t1_sum_both, "Environment (sum over both)")
     assert env_t1_sum_both.inds == (), "Should be scalar"
@@ -184,7 +184,7 @@ def main():
     full_sigma_tn = btn.sigma & sigma_inputs
 
     print("\nDefault SIGMA environment:")
-    env_sigma_default = btn.get_environment(full_sigma_tn, 'T1_sigma', copy=True,
+    env_sigma_default = btn._batch_environment(full_sigma_tn, 'T1_sigma', copy=True,
                                             sum_over_batch=False, sum_over_output=False)
     inspect_result(env_sigma_default, "SIGMA Environment (default)")
     assert batch_dim in env_sigma_default.inds, "Batch dimension should be present"
@@ -196,7 +196,7 @@ def main():
     print("✅ SIGMA environment has prime indices")
 
     print("\nSIGMA environment with sum_over_batch:")
-    env_sigma_sum = btn.get_environment(full_sigma_tn, 'T1_sigma', copy=True,
+    env_sigma_sum = btn._batch_environment(full_sigma_tn, 'T1_sigma', copy=True,
                                         sum_over_batch=True, sum_over_output=False)
     inspect_result(env_sigma_sum, "SIGMA Environment (sum over batch)")
     assert batch_dim not in env_sigma_sum.inds, "Batch dimension should be contracted"

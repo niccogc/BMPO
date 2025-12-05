@@ -100,7 +100,7 @@ result_sum = btn.forward(mu_tn, batches, sum_over_batch=True)
 
 ## Environment Calculations
 
-### `get_environment(tn, target_tag, copy=True, sum_over_batch=False, sum_over_output=False)`
+### `_batch_environment(tn, target_tag, copy=True, sum_over_batch=False, sum_over_output=False)`
 
 Calculates environment for a single batch by removing target tensor and contracting the rest.
 
@@ -122,18 +122,18 @@ Calculates environment for a single batch by removing target tensor and contract
 full_tn = mu_tn & inputs  # Add inputs to network
 
 # Remove T2, get environment
-env = btn.get_environment(full_tn, 'T2')
+env = btn._batch_environment(full_tn, 'T2')
 # Indices: ('s', 'y2', 'k1', 'x2', 'k2')
 #   - 's': batch dimension
 #   - 'y2': output from T3 (T2's y1 is gone)
 #   - 'k1', 'k2', 'x2': holes where T2 connected
 
 # Sum over batch
-env_sum = btn.get_environment(full_tn, 'T2', sum_over_batch=True)
+env_sum = btn._batch_environment(full_tn, 'T2', sum_over_batch=True)
 # Indices: ('y2', 'k1', 'x2', 'k2')  # No 's'
 
 # Sum over output dimensions (keep holes!)
-env_no_out = btn.get_environment(full_tn, 'T2', sum_over_output=True)
+env_no_out = btn._batch_environment(full_tn, 'T2', sum_over_output=True)
 # Indices: ('s', 'k1', 'x2', 'k2')  # No 'y2'
 ```
 
@@ -164,7 +164,7 @@ env_sum = btn.get_environment_batched(mu_tn, 'T1', batches, sum_over_batch=True)
 inputs_with_y = inputs + [y_tensor]
 
 # When y is added, output indices contract!
-env_with_y = btn.get_environment(mu_tn & inputs_with_y, 'T1')
+env_with_y = btn._batch_environment(mu_tn & inputs_with_y, 'T1')
 # y1, y2 are contracted with network outputs
 # Only holes and unconsumed outputs remain
 ```
