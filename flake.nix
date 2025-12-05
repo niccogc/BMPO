@@ -77,7 +77,6 @@
         pythonWithNixPkgs
         pkgs.uv
         pkgs.opencode
-        pkgs.noto-fonts-color-emoji
       ];
 
       shellHook = ''
