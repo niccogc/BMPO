@@ -1,4 +1,7 @@
 # type: ignore
+import importlib
+
+from logging import ERROR
 from typing import List, Dict, Optional, Tuple
 import quimb.tensor as qt
 import numpy as np
@@ -530,7 +533,7 @@ class BTN:
         tau_expectation = self.get_tau_mean()
         sigma_env = self.get_environment(
                          tn =self.sigma,
-                         target_tag=node_tag + '_sigma',
+                         target_tag=node_tag ,
                          input_generator=self.data.data_sigma,
                          copy=False,
                          sum_over_batch = True,
@@ -548,21 +551,119 @@ class BTN:
             node_tag=node_tag,
         )
         original_inds = theta.inds # Get a copy of indices to iterate over
-        print(original_inds)
 
         for old_ind in original_inds:
             primed_ind = old_ind + '_prime'
             # Expand the original index into the desired diagonal pair
             # The original values are placed along the diagonal of (old_ind, primed_ind)
             theta = theta.new_ind_pair_diag(old_ind, old_ind, primed_ind)
-        print("sigma_env_shape")
-        print(sigma_env.inds)
-        print("mu_outer_env")
-        print(mu_outer_env.inds)
-        print("theta")
-        print(theta.inds)
-        # precision = tau_expectation * (sigma_env + mu_outer_env) + theta
-        # return precision
+        precision = tau_expectation * (sigma_env + mu_outer_env) + theta
+        # Broadcast over original output dimension
+        # To do after inverting.
+        # The inverse of a broadcast is the broadcast of the inverse o.o
+        # Just because we only care of the diagonal part of the broadcasted dimension, so It is the same as outer producting with an identity
+        return precision
+
+    def _get_sigma_update(self, node_tag):
+        block_output_ind = [i for i in self.mu[node_tag].inds if i in self.output_dimensions]
+        block_variational_ind = [i for i in self.mu[node_tag].inds if i not in self.output_dimensions]
+        precision = self.compute_precision_node(node_tag)
+        tag = node_tag 
+        sigma_node = self.invert_ordered_tensor(precision, block_variational_ind, tag = tag)
+        for i in block_output_ind:
+            sigma_node.new_ind(i, self.mu.ind_size(i))
+        return sigma_node
+
+    def update_sigma_node(self, node_tag):
+        sigma_update = self._get_sigma_update(node_tag)
+        # TODO: + _sigma? or lets call all nodes with same tag de
+        self.update_node(self.sigma, sigma_update, node_tag)
+        return
+    
+    def update_node(self, tn, tensor, node_tag):
+        """
+        Updates the tensor network by replacing the node with the given tag
+        with the new tensor.
+        """
+        # Identify tensors to remove (collect first to avoid iterator modification issues)
+        to_remove = [t for t in tn if node_tag in t.tags]
+    
+        # Remove existing
+        for t in to_remove:
+            tn.remove_tensor(t)
+        
+        # Add new
+        tn.add_tensor(tensor)
+    
+    def get_backend(self, data):
+        module = type(data).__module__
+        if 'torch' in module:
+            return 'torch', importlib.import_module('torch')
+        elif 'jax' in module:
+            return 'jax', importlib.import_module('jax.numpy')
+        elif 'numpy':
+            return 'numpy', np
+
+    def cholesky_invert(self, matrix, backend_name, lib):
+        """Inverts Hermitian positive-definite matrix via Cholesky."""
+        if backend_name == 'torch':
+            # Torch has a dedicated cholesky_inverse
+            L = lib.linalg.cholesky(matrix)
+            return lib.cholesky_inverse(L)
+        elif backend_name == 'jax':
+            # JAX requires solve against identity or custom implementation
+            L = lib.linalg.cholesky(matrix)
+            id_mat = lib.eye(matrix.shape[0], dtype=matrix.dtype)
+            return lib.linalg.solve(matrix, id_mat) # Often more stable than explicit inv
+        elif backend_name == 'numpy':
+            try:
+                L = lib.linalg.cholesky(matrix)
+                inv_L = lib.linalg.inv(L)
+                return inv_L.T.conj() @ inv_L
+            except lib.linalg.LinAlgError:
+                return lib.linalg.inv(matrix)
+        else:
+            raise ValueError(f"Unknown backend '{backend_name}' for inversion.")
+
+    def invert_ordered_tensor(self, tensor, index_bases, method='cholesky', tag=None):
+        """
+        Args:
+            tensor: quimb.Tensor or TensorNetwork
+            index_bases: list of str (the base index names, e.g. ['k', 'a'])
+            method: 'direct' or 'cholesky'
+        """
+        if tag is None:
+            tag = tensor.tags
+        # 1. Sort indices for consistent ordering
+        # We define rows as the base indices, cols as base + '_prime'
+        row_inds = sorted(index_bases)
+        col_inds = [i + '_prime' for i in row_inds]
+     # 2. Transpose Tensor to (Row_Inds, Col_Inds)
+        # This orders the data contiguously in memory for the matrix view
+        tensor = tensor.transpose(*row_inds, *col_inds)
+        # 2. Extract Matrix
+        # to_dense(rows, cols) handles the random internal ordering automatically
+        matrix_data = tensor.to_dense(row_inds, col_inds)
+
+        # 3. Detect Backend
+        backend_name, lib = self.get_backend(matrix_data)
+
+        # 4. Invert
+        if method == 'cholesky':
+            inv_data = self.cholesky_invert(matrix_data, backend_name, lib)
+        else:
+            # Standard inversion
+            if backend_name in ('torch', 'jax', 'numpy'):
+                inv_data = lib.linalg.inv(matrix_data)
+            else:
+                raise ValueError(f"Unknown backend '{backend_name}' for inversion.")
+
+        sizes = tensor.ind_sizes()
+        new_shape = tuple(sizes[i] for i in col_inds + row_inds)
+    
+        inv_tensor_data = inv_data.reshape(new_shape)
+
+        return qt.Tensor(data=inv_tensor_data, inds=col_inds + row_inds, tags=tag)        
 
     def outer_operation(self, input_generator, tn, node_tag, sum_over_batches):
         if sum_over_batches:

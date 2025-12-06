@@ -266,7 +266,7 @@ class BTNBuilder:
                 new_shape.append(shape_map[original_name])
             
             sigma_data = np.random.randn(*new_shape) * 0.01
-            sigma_tags = {f"{tag}_sigma" for tag in original_tags}
+            sigma_tags = {f"{tag}" for tag in original_tags}
 
             sigma_tensor = qt.Tensor(
                 data=sigma_data,
@@ -283,7 +283,7 @@ class BTNBuilder:
             
             sigma_tensor = None
             for tag in tensor.tags:
-                sigma_tag = f"{tag}_sigma"
+                sigma_tag = f"{tag}"
                 try:
                     candidates = self.sigma_tn[sigma_tag]
                     if isinstance(candidates, qt.Tensor):

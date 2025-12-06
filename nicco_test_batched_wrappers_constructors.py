@@ -50,7 +50,6 @@ tn = model.mu
 env_mu = model.get_environment(tn, tag, generator.data_mu, True, True, True)
 print(tn[tag].inds)
 print(env_mu.inds)
-
 print("="*10)
 outer_op = model.outer_operation(tn=tn, input_generator= generator.data_mu, node_tag=tag, sum_over_batches=True)
 print(outer_op)
@@ -59,4 +58,7 @@ print(model.get_tau_mean())
 print("=*="*20)
 print("la precision")
 precision = model.compute_precision_node(tag)
-print(precision)
+
+print(precision.inds)
+print("=*="*20)
+print(model.sigma[tag+'_sigma'].inds)
