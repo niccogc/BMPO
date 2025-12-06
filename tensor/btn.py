@@ -231,7 +231,8 @@ class BTN:
                             input_generator,
                             tn: qt.TensorNetwork,
                             mode: str = 'dot',
-                            sum_over_batch: bool = False
+                            sum_over_batch: bool = False,
+                            output_inds=[]
                         ):
         """
            Forward to pass a dot product or compute MSE.
@@ -243,7 +244,8 @@ class BTN:
                 input_generator,
                 tn = tn,
                 mode = mode,
-                sum_over_batch = sum_over_batch
+                sum_over_batch = sum_over_batch,
+                output_inds = output_inds
             )
         else:
             result = self._concat_over_batches(
@@ -251,7 +253,8 @@ class BTN:
                 input_generator,
                 tn = tn,
                 mode = mode,
-                sum_over_batch = sum_over_batch
+                sum_over_batch = sum_over_batch,
+                output_inds = output_inds
             )
         return result
     
@@ -260,7 +263,8 @@ class BTN:
                                    y: qt.Tensor,
                                    tn: qt.TensorNetwork,
                                    mode: str = 'dot',
-                                   sum_over_batch: bool = False
+                                   sum_over_batch: bool = False,
+                                   output_inds: List[str] = None,
                                 ):
         """
         Forward pass coupled with target output y.
@@ -277,6 +281,7 @@ class BTN:
             - 'dot': scalar product forward · y
             - 'squared_error': (forward - y)^2
         """
+        output_inds = [] if output_inds is None else output_inds
         if mode == 'dot':
             # Scalar product: add y to the network and contract
             # y has indices (s, y1, y2, ...), forward will match these
@@ -284,10 +289,10 @@ class BTN:
             
             if sum_over_batch:
                 # Contract everything (sum over all dims including batch)
-                result = full_tn.contract(output_inds=[])
+                result = full_tn.contract(output_inds=output_inds)
             else:
                 # Keep batch dimension
-                result = full_tn.contract(output_inds=[self.batch_dim])
+                result = full_tn.contract(output_inds=[self.batch_dim]+output_inds)
             
             return result
             
@@ -574,9 +579,29 @@ class BTN:
             sigma_node.new_ind(i, self.mu.ind_size(i))
         return sigma_node
 
+    def _get_mu_update(self, node_tag):
+        mu_idx = self.mu[node_tag].inds
+        self.mu.delete(node_tag)
+        print(mu_idx)
+        rhs = self.forward_with_target(
+            self.data.data_mu_y,
+            self.mu,
+            'dot',
+            sum_over_batch = True,
+            output_inds = mu_idx
+        )
+        print("RHS")
+        print(rhs)
+        tn = rhs & self.sigma[node_tag]
+        print("TN")
+        print(tn)
+        mu_update = tn.contract(output_inds=mu_idx)
+        print("MU_UPDATE")
+        print(mu_update)
+        return mu_update
+    
     def update_sigma_node(self, node_tag):
         sigma_update = self._get_sigma_update(node_tag)
-        # TODO: + _sigma? or lets call all nodes with same tag de
         self.update_node(self.sigma, sigma_update, node_tag)
         return
     
@@ -586,13 +611,9 @@ class BTN:
         with the new tensor.
         """
         # Identify tensors to remove (collect first to avoid iterator modification issues)
-        to_remove = [t for t in tn if node_tag in t.tags]
-    
         # Remove existing
-        for t in to_remove:
-            tn.remove_tensor(t)
+        tn.delete(node_tag)
         
-        # Add new
         tn.add_tensor(tensor)
     
     def get_backend(self, data):
@@ -636,8 +657,8 @@ class BTN:
             tag = tensor.tags
         # 1. Sort indices for consistent ordering
         # We define rows as the base indices, cols as base + '_prime'
-        row_inds = sorted(index_bases)
-        col_inds = [i + '_prime' for i in row_inds]
+        col_inds = sorted(index_bases)
+        row_inds = [i + '_prime' for i in col_inds]
      # 2. Transpose Tensor to (Row_Inds, Col_Inds)
         # This orders the data contiguously in memory for the matrix view
         tensor = tensor.transpose(*row_inds, *col_inds)
@@ -658,8 +679,8 @@ class BTN:
             else:
                 raise ValueError(f"Unknown backend '{backend_name}' for inversion.")
 
-        sizes = tensor.ind_sizes()
-        new_shape = tuple(sizes[i] for i in col_inds + row_inds)
+        # sizes = [tensor.ind_size(i) for i in col_inds + row_inds]
+        new_shape = tuple(tensor.ind_size(i) for i in col_inds + row_inds)
     
         inv_tensor_data = inv_data.reshape(new_shape)
 
