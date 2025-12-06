@@ -25,7 +25,8 @@ class BTN:
             batch_dim: Batch dimension label.
             input_indices: List of input indices (leaf nodes). If None, automatically detected.
             not_trainable_nodes: List of node tags that should not be trained (e.g., input nodes).
-                                These nodes will be tagged with NOT_TRAINABLE_TAG ('NT').
+
+            These nodes will be tagged with NOT_TRAINABLE_TAG ('NT').
         """
         self.mu = mu
         self.output_dimensions = data_stream.outputs_labels
@@ -108,17 +109,20 @@ class BTN:
             result = self._sum_over_batches(
                 self._batch_forward,
                 input_generator,
+                tn = tn,
                 output_inds = target_inds
             )
         else:
             result = self._concat_over_batches(
                 self._batch_forward,
                 input_generator,
+                tn = tn,
                 output_inds = target_inds
             )
         return result
     
-    def get_environment(self, tn_base: qt.TensorNetwork, target_tag: str, 
+    def get_environment(self, tn: qt.TensorNetwork,
+                                 target_tag: str, 
                                  input_generator,
                                  copy: bool = True,
                                  sum_over_batch: bool = False, 
@@ -139,13 +143,16 @@ class BTN:
             Environment tensor. If sum_over_batch=False, concatenates batches.
             If sum_over_batch=True, sums on-the-fly across batches.
         """
+        if copy:
+            tn_base = tn.copy()
+        else:
+            tn_base = tn
         if sum_over_batch:
             result = self._sum_over_batches(
                                 self._batch_environment,
                                 input_generator,
                                 tn = tn_base,
                                 target_tag=target_tag,
-                                copy=copy,
                                 sum_over_batch=sum_over_batch,
                                 sum_over_output=sum_over_output
                             )
@@ -155,13 +162,12 @@ class BTN:
                                 input_generator,
                                 tn = tn_base,
                                 target_tag=target_tag,
-                                copy=copy,
                                 sum_over_batch=sum_over_batch,
                                 sum_over_output=sum_over_output
                             )
         return result
 
-    def _batch_environment(self, inputs, tn: qt.TensorNetwork, target_tag: str, copy: bool = True,
+    def _batch_environment(self, inputs, tn: qt.TensorNetwork, target_tag: str,
                         sum_over_batch: bool = False, sum_over_output: bool = False) -> qt.Tensor:
         """
         Calculates the environment for a target tensor (single batch).
@@ -178,12 +184,8 @@ class BTN:
             Environment tensor with indices determined by flags.
             The "hole" indices (where the removed tensor connects) are always kept.
         """
-        tn_with_inputs = tn & inputs
+        env_tn= tn & inputs
         # 1. Create the "hole"
-        if copy:
-            env_tn = tn_with_inputs.copy()
-        else:
-            env_tn = tn_with_inputs
         env_tn.delete(target_tag)
 
         # 2. Determine which indices to keep based on flags
@@ -366,7 +368,7 @@ class BTN:
             inputs = batch_data if isinstance(batch_data, tuple) else (batch_data,)
             
             # Execute operation
-            batch_res = batch_operation(batch_idx, *inputs, *args, **kwargs)
+            batch_res = batch_operation(*inputs, *args, **kwargs)
             results.append(batch_res)
             
         return self._concat_batch_results(results)
@@ -518,23 +520,49 @@ class BTN:
         
         return primed_node
 
+    def get_tau_mean(self):
+        return self.q_tau.mean()
+
     def compute_precision_node(self,
                                    node_tag: str,
-                                   inputs: any) -> qt.Tensor:
+                               ) -> qt.Tensor:
 
-        tau_expectation = self.q_tau.mean()
-        sigma_env = None
-        mu_outer_env = None
-        theta = None
+        tau_expectation = self.get_tau_mean()
+        sigma_env = self.get_environment(
+                         tn =self.sigma,
+                         target_tag=node_tag + '_sigma',
+                         input_generator=self.data.data_sigma,
+                         copy=False,
+                         sum_over_batch = True,
+                         sum_over_output=True
+                     )
+
+        mu_outer_env = self.outer_operation(
+            tn=self.mu,
+            node_tag=node_tag,
+            input_generator=self.data.data_mu,
+            sum_over_batches=True
+        )
+
+        theta = self.theta_block_computation(
+            node_tag=node_tag,
+        )
         original_inds = theta.inds # Get a copy of indices to iterate over
+        print(original_inds)
 
         for old_ind in original_inds:
             primed_ind = old_ind + '_prime'
             # Expand the original index into the desired diagonal pair
             # The original values are placed along the diagonal of (old_ind, primed_ind)
             theta = theta.new_ind_pair_diag(old_ind, old_ind, primed_ind)
-        precision = tau_expectation * (sigma_env + mu_outer_env) + theta
-        return precision
+        print("sigma_env_shape")
+        print(sigma_env.inds)
+        print("mu_outer_env")
+        print(mu_outer_env.inds)
+        print("theta")
+        print(theta.inds)
+        # precision = tau_expectation * (sigma_env + mu_outer_env) + theta
+        # return precision
 
     def outer_operation(self, input_generator, tn, node_tag, sum_over_batches):
         if sum_over_batches:
@@ -581,16 +609,16 @@ class BTN:
             tn,
             target_tag=node_tag,
             sum_over_batch=False,
-            sum_over_output=False
+            sum_over_output=True
         )
       
+        sample_dim = [self.batch_dim] if not sum_over_batches else []
         # Prime indices (exclude output)
-        env_prime = self.prime_indices_tensor(env, exclude_indices=self.output_dimensions)
+        env_prime = self.prime_indices_tensor(env, exclude_indices=self.output_dimensions+[self.batch_dim])
         # Outer product via tensor network (sums over shared output indices)
 
         env_inds = env.inds + env_prime.inds
         outer_tn = env & env_prime
-        sample_dim = [self.batch_dim] if sum_over_batches else []
         out_indices = sample_dim + [i for i in env_inds if i not in [self.batch_dim]]
         batch_result = outer_tn.contract(output_inds = out_indices)
         return batch_result

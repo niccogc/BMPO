@@ -1,39 +1,94 @@
 # type: ignore
-import itertools
-import math
+import random
+from tensor.distributions import GammaDistribution, MultivariateGaussianDistribution
 import numpy as np
-import quimb.tensor as qt
-from typing import List, Dict, Tuple, Any, Optional
-
-from tensor.distributions import (
-    GammaDistribution, 
-    MultivariateGaussianDistribution, 
-    ProductDistribution
-)
+from typing import List, Dict, Any, Tuple, Optional
+import quimb.tensor as qt  # Assuming quimb.tensor is available
 
 class Inputs:
     """
-        input is a list of lenght number of batches, where there is a dictionary of what the inputs are connecting for and which labels TODO: make a method that batches and labels auto.
+    Input loader that pre-computes and stores batches in a list.
+    Allows efficient multiple passes (epochs) over the data.
     """
-    def __init__(self, inputs: List[any],
-                 outputs: List[any],
+    def __init__(self, inputs: List[Any],
+                 outputs: List[Any],
                  outputs_labels: List[str],
                  input_labels: List[str],
                  batch_dim: str = "s",
                  batch_size = None):
 
-        self.batch_size = inputs[0].shape[0] if batch_size is None else batch_size
-        self.samples = outputs[0].shape[0]
-        self.batch_dim = batch_dim
-        self.repeated = (len(inputs) == 1)
+        # 1. Configuration
+        self.inputs_data = inputs
+        self.outputs_data = outputs
         self.outputs_labels = outputs_labels
         self.input_labels = input_labels
+        self.batch_dim = batch_dim
+        
+        self.batch_size = inputs[0].shape[0] if batch_size is None else batch_size
+        self.samples = outputs[0].shape[0]
+        self.repeated = (len(inputs) == 1)
+        
         print("It is assumed that the Inputs and outputs in list are ordered as labels")
-        raw_batches = self.batch_splits(inputs, outputs[0], self.batch_size)
-        self.mu_sigma_y_batches = self.create_node_from_batch_splits(raw_batches)
+
+        # 2. Pre-compute all batches once and store them
+        # Storage format: List[Tuple(mu_tensors, prime_tensors, y_tensor)]
+        self.batches = self._create_batches()
+
+    def _create_batches(self) -> List[Tuple[List[qt.Tensor], List[qt.Tensor], qt.Tensor]]:
+        """Generates and stores the list of all batches."""
+        batches = []
         
-        
+        # Generator for raw data slices
+        raw_splits = self.batch_splits(
+            self.inputs_data, 
+            self.outputs_data[0], 
+            self.batch_size
+        )
+
+        # Process into tensors
+        for input_dict, y_tensor in raw_splits:
+            if self.repeated:
+                mu, prime = self.prepare_inputs_batch_repeated(input_dict)
+            else:
+                mu, prime = self.prepare_inputs_batch(input_dict)
+            
+            batches.append((mu, prime, y_tensor))
+            
+        return batches
+
+    # --- Properties for Iteration ---
+
+    @property
+    def data_mu(self):
+        """Yields only mu input tensors."""
+        for mu, _, _ in self.batches:
+            yield mu
+
+    @property
+    def data_sigma(self):
+        """
+        Yields full input for sigma network.
+        Combines mu tensors + prime tensors (x, x').
+        """
+        for mu, prime, _ in self.batches:
+            yield mu + prime
+
+    @property
+    def data_y(self):
+        """Yields only target (y) tensors."""
+        for _, _, y in self.batches:
+            yield y
+
+    @property
+    def data_mu_y(self):
+        """Yields (mu inputs, target)."""
+        for mu, _, y in self.batches:
+            yield mu, y
+
+    # --- Processing Methods ---
+
     def batch_splits(self, xs, y, B):
+        """Generates raw dictionary/array slices."""
         s = y.shape[0]
         for i in range(0, s, B):
             tensor = qt.Tensor(
@@ -41,195 +96,95 @@ class Inputs:
                 inds=(self.batch_dim, *self.outputs_labels),
                 tags={'output'}
             )
-            batch ={f"{j}": x[i:i+B] for j, x in zip(self.input_labels[:len(xs)],xs)} 
+            batch = {f"{j}": x[i:i+B] for j, x in zip(self.input_labels[:len(xs)], xs)}
             yield batch, tensor
 
-    def create_node_from_batch_splits(self, batch_generator):
-            # Unpack the tuple yielded by batch_splits
-            for input_dict, y_tensor in batch_generator:
-            
-                # Process only the input dictionary
-                if self.repeated:
-                    mu, sigma = self.prepare_inputs_batch_repeated(input_dict)
-                else:
-                    mu, sigma = self.prepare_inputs_batch(input_dict)
-            
-                yield mu, sigma, y_tensor
-
-    def prepare_inputs_batch(self, input_data: Dict[str, any]) -> List[qt.Tensor]:
+    def prepare_inputs_batch(self, input_data: Dict[str, Any]) -> Tuple[List[qt.Tensor], List[qt.Tensor]]:
         """
-        Prepare input tensors for forward pass through the network.
-        
-        Args:
-            input_data: Dictionary mapping input index names to data arrays (numpy, torch, jax).
-                       Two scenarios supported:
-                       1. Single input for all nodes: {'x1': array of shape (samples, features)}
-                          Creates identical input nodes x1, x2, ... with same data
-                       2. Separate inputs per node: {'x1': data_1, 'x2': data_2, ...}
-                          Each input index gets its own data
-            for_sigma: If True, doubles the inputs with '_prime' suffix for sigma network.
-                      If False, creates single copy for mu network.
-        
         Returns:
-            List of quimb.Tensor objects ready for forward pass.
-            
-        Example:
-            # Scenario 2: Different data per node
-            input_data = {'x1': data_1, 'x2': data_2}
-            mu_inputs = btn.prepare_inputs(input_data, for_sigma=False)
-            # Creates: x1(s, x1, data_1), x2(s, x2, data_2)
-            
-            # For sigma network (doubles inputs):
-            sigma_inputs = btn.prepare_inputs(input_data, for_sigma=True)
-            # Creates: x1(s, x1, data), x1_prime(s, x1_prime, data), x2(s, x2, data), x2_prime(s, x2_prime, data)
+            tensors_mu: List of tensors for mu network [x1, x2...]
+            tensors_prime: List of prime tensors for sigma network [x1', x2'...]
         """
-        # Use input_indices from class (either provided or auto-detected in __init__)
         tensors_mu = []
-        tensors_sigma = []
-        for k,v in input_data.items():
+        tensors_prime = []
+        for k, v in input_data.items():
+            assert v.ndim == 2, f"Input data for '{k}' must be 2D, got {v.shape}"
             
-            # Assert correct shape (must be 2D: batch x features)
-            assert v.ndim == 2, f"Input data for '{k}' must be 2D (batch_size, features), got shape {v.shape}"
-            
-            # Create tensor with indices (batch_dim, input_idx)
-            tensor = qt.Tensor(
-                data=v,
-                inds=(self.batch_dim, k),
-                tags={f'input_{k}'}
-            )
+            # Mu tensor
+            tensor = qt.Tensor(data=v, inds=(self.batch_dim, k), tags={f'input_{k}'})
             tensors_mu.append(tensor)
-            # If for_sigma, also create the prime version with the same data
+            
+            # Sigma (prime) tensor
             prime_idx = f"{k}_prime"
-            tensor_prime = qt.Tensor(
-                data=v,  # Points to same data
-                inds=(self.batch_dim, prime_idx),
-                tags={f'input_{prime_idx}'}
-            )
-            tensors_sigma.append(tensor_prime)
+            tensor_prime = qt.Tensor(data=v, inds=(self.batch_dim, prime_idx), tags={f'input_{prime_idx}'})
+            tensors_prime.append(tensor_prime)
         
-        return tensors_mu, tensors_mu + tensors_sigma
+        return tensors_mu, tensors_prime
 
-    def prepare_inputs_batch_repeated(self, input_data: Dict[str, any]) -> List[qt.Tensor]:
+    def shuffle(self):
+        """Shuffles the internal list of batches in-place."""
+        random.shuffle(self.batches)
+
+    def __len__(self):
+        """Returns the number of batches."""
+        return len(self.batches)
+
+    def __getitem__(self, idx):
         """
-        Prepare input tensors for forward pass through the network.
-        
-        Args:
-            input_data: Dictionary mapping input index names to data arrays (numpy, torch, jax).
-                       Two scenarios supported:
-                       1. Single input for all nodes: {'x1': array of shape (samples, features)}
-                          Creates identical input nodes x1, x2, ... with same data
-                       2. Separate inputs per node: {'x1': data_1, 'x2': data_2, ...}
-                          Each input index gets its own data
-            for_sigma: If True, doubles the inputs with '_prime' suffix for sigma network.
-                      If False, creates single copy for mu network.
+        Returns the raw batch at the specified index.
         
         Returns:
-            List of quimb.Tensor objects ready for forward pass.
-            
-        Example:
-            # Scenario 1: Same data for all input nodes
-            input_data = {'x1': np.random.randn(10, 4)}  # 10 samples, 4 features
-            mu_inputs = btn.prepare_inputs(input_data, for_sigma=False)
-            # Creates: x1(s, x1, data), x2(s, x2, data), ... with same data
-            # For sigma network (doubles inputs):
-            sigma_inputs = btn.prepare_inputs(input_data, for_sigma=True)
-            # Creates: x1(s, x1, data), x1_prime(s, x1_prime, data), x2(s, x2, data), x2_prime(s, x2_prime, data)
+            Tuple: (mu_tensors, prime_tensors, y_tensor)
+        
+        Note: To get full sigma inputs from this, you must concatenate mu + prime.
         """
-        # Use input_indices from class (either provided or auto-detected in __init__)
-        # Determine if we have single input for all or separate inputs
-        # Scenario 1: Single input data for all input nodes
+        return self.batches[idx]
 
+    def prepare_inputs_batch_repeated(self, input_data: Dict[str, Any]) -> Tuple[List[qt.Tensor], List[qt.Tensor]]:
         input_indices = self.input_labels
         single_key = list(input_data.keys())[0]
         data = input_data[single_key]
         
-        # Assert correct shape (must be 2D: batch x features)
-        assert data.ndim == 2, f"Input data must be 2D (batch_size, features), got shape {data.shape}"
+        assert data.ndim == 2, f"Input data must be 2D, got {data.shape}"
         
-        batch_size, feature_dim = data.shape
-        
-        # Create tensors for each input index pointing to the SAME data
         tensors_mu = []
-        tensors_sigma = []
+        tensors_prime = []
         for input_idx in input_indices:
-            # Create tensor with indices (batch_dim, input_idx)
-            # All tensors point to the same data object - no copy needed
-            tensor = qt.Tensor(
-                data=data,
-                inds=(self.batch_dim, input_idx),
-                tags={f'input_{input_idx}'}
-            )
+            # Mu tensor
+            tensor = qt.Tensor(data=data, inds=(self.batch_dim, input_idx), tags={f'input_{input_idx}'})
             tensors_mu.append(tensor)
-            # If for_sigma, also create the prime version
+            
+            # Sigma (prime) tensor
             prime_idx = f"{input_idx}_prime"
-            tensor_prime = qt.Tensor(
-                data=data,  # Points to same data
-                inds=(self.batch_dim, prime_idx),
-                tags={f'input_{prime_idx}'}
-            )
-            tensors_sigma.append(tensor_prime)
+            tensor_prime = qt.Tensor(data=data, inds=(self.batch_dim, prime_idx), tags={f'input_{prime_idx}'})
+            tensors_prime.append(tensor_prime)
        
-        return tensors_mu, tensors_mu + tensors_sigma
-
-    @property
-    def data_mu(self):
-        """Yields only (mu, sigma), discarding y."""
-        for mu, _, _ in self.mu_sigma_y_batches:
-            yield mu
-
-    @property
-    def data_sigma(self):
-        """Yields only (mu, sigma), discarding y."""
-        for _, sigma, _ in self.mu_sigma_y_batches:
-            yield sigma
-
-    @property
-    def data_y(self):
-        """Yields only (mu, sigma), discarding y."""
-        for _, _, y in self.mu_sigma_y_batches:
-            yield y
-
-    @property
-    def data_mu_y(self):
-        """Yields only (mu, sigma), discarding y."""
-        for mu, _, y in self.mu_sigma_y_batches:
-            yield mu, y
-    # Usage:
-    # for mu, sigma in loader.inputs_only:
-    #     ...
+        return tensors_mu, tensors_prime
 
     def __str__(self):
-            """
-            Allows calling print(loader_instance). 
-            Peeks at the first batch to show structure without consuming the data.
-            """
-            # 1. Tee the generator: 'view' is for printing, 'save' keeps the data safe
-            gen_view, self.mu_sigma_y_batches = itertools.tee(self.mu_sigma_y_batches)
+        """Summary of the loader structure."""
+        if not self.batches:
+            return ">>> InputLoader (Empty)"
+
+        # Peek at the first stored batch
+        mu, prime, y = self.batches[0]
         
-            try:
-                # 2. Peek at the first batch
-                first_batch = next(gen_view)
-                mu, sigma, y = first_batch
-            
-                # 3. Format the info
-                mu_inds = [list(t.inds) for t in mu]
-                sigma_inds = [list(t.inds) for t in sigma]
-            
-                # 4. Build the string
-                header = (
-                    f"\n>>> InputLoader Summary (Batch Size: {self.batch_size}, Samples: {self.samples}, Batches Number: {math.ceil(self.samples/ self.batch_size)})\n"
-                    f"{'TYPE':<8} | {'SHAPE':<15} | {'INDICES'}\n"
-                    f"{'-'*60}\n"
-                )
-            
-                row_y = f"{'Target':<8} | {str(y.shape):<15} | {y.inds}\n"
-                row_mu = f"{'Mu':<8} | {str(mu[0].shape):<15} | {mu_inds} ... ({len(mu)} tensors)\n"
-                row_sig = f"{'Sigma':<8} | {str(sigma[0].shape):<15} | {sigma_inds} ... ({len(sigma)} tensors)"
-            
-                return header + row_y + row_mu + row_sig
-            
-            except StopIteration:
-                return "InputLoader (Empty/Exhausted)"        
+        mu_inds = [list(t.inds) for t in mu]
+        prime_inds = [list(t.inds) for t in prime]
+        
+        header = (
+            f"\n>>> InputLoader Summary (Batch Size: {self.batch_size}, "
+            f"Samples: {self.samples}, Batches: {len(self.batches)})\n"
+            f"{'TYPE':<8} | {'SHAPE':<15} | {'INDICES'}\n"
+            f"{'-'*60}\n"
+        )
+        
+        row_y = f"{'Target':<8} | {str(y.shape):<15} | {y.inds}\n"
+        row_mu = f"{'Mu':<8} | {str(mu[0].shape):<15} | {mu_inds} ... ({len(mu)} tensors)\n"
+        # Note: Sigma output is Mu + Prime, but we store them separate. 
+        row_sig = f"{'Sigma':<8} | {str(prime[0].shape):<15} | Mu + {prime_inds} ... (+{len(prime)} tensors)"
+        
+        return header + row_y + row_mu + row_sig
 
 class BTNBuilder:
     """
