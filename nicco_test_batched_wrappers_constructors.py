@@ -61,4 +61,4 @@ precision = model.compute_precision_node(tag)
 
 print(precision.inds)
 print("=*="*20)
-print(model.sigma[tag+'_sigma'].inds)
+print(model.sigma[tag].inds)
