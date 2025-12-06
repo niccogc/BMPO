@@ -3,7 +3,8 @@ from typing import List, Dict, Optional, Tuple
 import quimb.tensor as qt
 import numpy as np
 
-from tensor.builder import BTNBuilder
+from tensor.builder import BTNBuilder, Inputs
+from tensor.distributions import GammaDistribution
 
 # Tag for nodes that should not be trained
 NOT_TRAINABLE_TAG = "NT"
@@ -11,9 +12,8 @@ NOT_TRAINABLE_TAG = "NT"
 class BTN:
     def __init__(self,
                  mu: qt.TensorNetwork,
-                 output_dimensions: List[str],
+                 data_stream: Inputs,
                  batch_dim: str = "s",
-                 input_indices: List[str] = None,
                  not_trainable_nodes: List[str] = None
                  ):
         """
@@ -28,9 +28,10 @@ class BTN:
                                 These nodes will be tagged with NOT_TRAINABLE_TAG ('NT').
         """
         self.mu = mu
-        self.output_dimensions = output_dimensions
+        self.output_dimensions = data_stream.outputs_labels
         self.batch_dim = batch_dim
-        
+        self.input_indices = data_stream.input_labels
+        self.data = data_stream
         # Tag not trainable nodes with NT tag
         not_trainable_nodes = not_trainable_nodes or []
         for node_tag in not_trainable_nodes:
@@ -38,24 +39,11 @@ class BTN:
             tensors = self.mu.select_tensors(node_tag, which='any')
             for tensor in tensors:
                 tensor.add_tag(NOT_TRAINABLE_TAG)
-        
         # Store the list of not trainable node tags
         self.not_trainable_nodes = not_trainable_nodes
-        
-        # Determine input indices
-        if input_indices is not None:
-            self.input_indices = sorted(input_indices)
-        else:
-            # Auto-detect: input indices are leaf indices (appear only once)
-            ind_count = {}
-            for tensor in self.mu:
-                for ind in tensor.inds:
-                    if ind not in self.output_dimensions and ind != self.batch_dim:
-                        ind_count[ind] = ind_count.get(ind, 0) + 1
-            self.input_indices = sorted([ind for ind, count in ind_count.items() if count == 1])
-
+      
         # --- Initialize Builder and Model Components ---
-        self.builder = BTNBuilder(self.mu, self.output_dimensions, self.batch_dim)
+        builder = BTNBuilder(self.mu, self.output_dimensions, self.batch_dim)
         
         # Build and unpack components
         # p_bonds: Priors for edges (Gamma)
@@ -63,11 +51,13 @@ class BTN:
         # q_bonds: Posteriors for edges (Gamma)
         # q_nodes: Posteriors for nodes (Gaussian)
         # sigma: The covariance TensorNetwork
+        self.p_tau = GammaDistribution(concentration = 1, rate = 1)
+        self.q_tau = GammaDistribution(concentration = 1, rate = 1)
         (self.p_bonds, 
          self.p_nodes, 
          self.q_bonds, 
          self.q_nodes, 
-         self.sigma) = self.builder.build_model()
+         self.sigma) = builder.build_model()
 
     def _copy_data(self, data):
         """Helper to copy data arrays, backend-agnostic."""
@@ -80,12 +70,16 @@ class BTN:
             import numpy as np
             return np.array(data)
 
-    def _batch_forward(self, tn: qt.TensorNetwork, inputs: List[qt.Tensor], output_inds: List[str]) -> qt.Tensor:
+    def _batch_forward(self, inputs: List[qt.Tensor], tn, output_inds: List[str]) -> qt.Tensor:
         """Helper for forward pass, contracting a single batch of inputs."""
-        full_tn = tn & inputs
-        return full_tn.contract(output_inds=output_inds)
 
-    def forward(self, tn: qt.TensorNetwork, inputs: List[List[qt.Tensor]], 
+        full_tn = tn & inputs
+        res = full_tn.contract(output_inds=output_inds)
+        if len(output_inds) > 0:
+            res.transpose_(*output_inds)
+        return res 
+
+    def forward(self, tn: qt.TensorNetwork, input_generator, 
                 sum_over_batch: bool = False, sum_over_output: bool = False):
         """
         Performs the batched forward pass.
@@ -111,65 +105,63 @@ class BTN:
             target_inds = [self.batch_dim] + self.output_dimensions  # Keep both
         
         if sum_over_batch:
-            # Sum on-the-fly - don't store all batches
-            result = None
-            for batch_tensors in inputs:
-                res = self._batch_forward(tn, batch_tensors, output_inds=target_inds)
-                
-                if len(target_inds) > 0:
-                    res.transpose_(*target_inds)
-                
-                if result is None:
-                    result = res
-                else:
-                    # Sum using quimb + operator
-                    result = result + res
-            
-            return result
+            result = self._sum_over_batches(
+                self._batch_forward,
+                input_generator,
+                output_inds = target_inds
+            )
         else:
-            # Concatenate batches - need to collect them
-            batch_results = []
-            for batch_tensors in inputs:
-                res = self._batch_forward(tn, batch_tensors, output_inds=target_inds)
-                
-                if len(target_inds) > 0:
-                    res.transpose_(*target_inds)
-                
-                batch_results.append(res)
-            
-
-    def prepare_inputs_for_sigma(self, input_data: Dict[str, any], for_sigma: bool = False) -> List[qt.Tensor]:
+            result = self._concat_over_batches(
+                self._batch_forward,
+                input_generator,
+                output_inds = target_inds
+            )
+        return result
+    
+    def get_environment(self, tn_base: qt.TensorNetwork, target_tag: str, 
+                                 input_generator,
+                                 copy: bool = True,
+                                 sum_over_batch: bool = False, 
+                                 sum_over_output: bool = False
+                             ):
         """
-        Prepare inputs for the sigma network.
-        
-        For sigma, we need inputs for both regular and primed indices:
-        - Regular: same as mu inputs
-        - Primed: same data but with _prime suffix on indices
+        Calculates the environment for a target tensor over multiple batches.
         
         Args:
-            input_data: Dictionary mapping input index names to data arrays
-            for_sigma: If True, returns inputs for both regular and primed indices
-        
+            tn_base: Base TensorNetwork (without inputs)
+            target_tag: Tag identifying the tensor to remove
+            input_batches: List of batches, where each batch is a list of input tensors
+            copy: Whether to copy the network before modification
+            sum_over_batch: If True, sums over batch dimension
+            sum_over_output: If True, also sums over output dimensions
+            
         Returns:
-            List of input tensors (regular + primed if for_sigma=True)
+            Environment tensor. If sum_over_batch=False, concatenates batches.
+            If sum_over_batch=True, sums on-the-fly across batches.
         """
-        # Get regular inputs
-        regular_inputs = self.prepare_inputs(input_data)
-        
-        if not for_sigma:
-            return regular_inputs
-        
-        # Create primed versions
-        primed_inputs = []
-        for inp in regular_inputs:
-            # Prime all indices except batch_dim
-            primed_inp = self.prime_indices_tensor(inp, exclude_indices=[self.batch_dim])
-            primed_inputs.append(primed_inp)
-        
-        # Return both regular and primed
-        return regular_inputs + primed_inputs
+        if sum_over_batch:
+            result = self._sum_over_batches(
+                                self._batch_environment,
+                                input_generator,
+                                tn = tn_base,
+                                target_tag=target_tag,
+                                copy=copy,
+                                sum_over_batch=sum_over_batch,
+                                sum_over_output=sum_over_output
+                            )
+        else:
+            result = self._concat_over_batches(
+                                self._batch_environment,
+                                input_generator,
+                                tn = tn_base,
+                                target_tag=target_tag,
+                                copy=copy,
+                                sum_over_batch=sum_over_batch,
+                                sum_over_output=sum_over_output
+                            )
+        return result
 
-    def _batch_environment(self, tn: qt.TensorNetwork, target_tag: str, copy: bool = True,
+    def _batch_environment(self, inputs, tn: qt.TensorNetwork, target_tag: str, copy: bool = True,
                         sum_over_batch: bool = False, sum_over_output: bool = False) -> qt.Tensor:
         """
         Calculates the environment for a target tensor (single batch).
@@ -186,11 +178,12 @@ class BTN:
             Environment tensor with indices determined by flags.
             The "hole" indices (where the removed tensor connects) are always kept.
         """
+        tn_with_inputs = tn & inputs
         # 1. Create the "hole"
         if copy:
-            env_tn = tn.copy()
+            env_tn = tn_with_inputs.copy()
         else:
-            env_tn = tn
+            env_tn = tn_with_inputs
         env_tn.delete(target_tag)
 
         # 2. Determine which indices to keep based on flags
@@ -228,62 +221,42 @@ class BTN:
         
         return env_tensor
 
-    def get_environment_batched(self, tn_base: qt.TensorNetwork, target_tag: str, 
-                                 input_batches: List[List[qt.Tensor]],
-                                 copy: bool = True, sum_over_batch: bool = False, 
-                                 sum_over_output: bool = False):
+    def forward_with_target(
+                            self,
+                            input_generator,
+                            tn: qt.TensorNetwork,
+                            mode: str = 'dot',
+                            sum_over_batch: bool = False
+                        ):
         """
-        Calculates the environment for a target tensor over multiple batches.
-        
-        Args:
-            tn_base: Base TensorNetwork (without inputs)
-            target_tag: Tag identifying the tensor to remove
-            input_batches: List of batches, where each batch is a list of input tensors
-            copy: Whether to copy the network before modification
-            sum_over_batch: If True, sums over batch dimension
-            sum_over_output: If True, also sums over output dimensions
-            
-        Returns:
-            Environment tensor. If sum_over_batch=False, concatenates batches.
-            If sum_over_batch=True, sums on-the-fly across batches.
+           Forward to pass a dot product or compute MSE.
+           The generator should return mu_y or sigma_y
         """
         if sum_over_batch:
-            # Sum on-the-fly - don't store all batch environments
-            result = None
-            for batch_inputs in input_batches:
-                # Create full network with this batch of inputs
-                tn_with_inputs = tn_base & batch_inputs
-                
-                # Get environment for this batch
-                env = self._batch_environment(tn_with_inputs, target_tag, copy=copy,
-                                          sum_over_batch=sum_over_batch, 
-                                          sum_over_output=sum_over_output)
-                
-                if result is None:
-                    result = env
-                else:
-                    # Sum using quimb + operator
-                    result = result + env
-            
-            return result
+            result = self._sum_over_batches(
+                self._batch_forward_with_target,
+                input_generator,
+                tn = tn,
+                mode = mode,
+                sum_over_batch = sum_over_batch
+            )
         else:
-            # Concatenate batches - need to collect them
-            batch_envs = []
-            for batch_inputs in input_batches:
-                # Create full network with this batch of inputs
-                tn_with_inputs = tn_base & batch_inputs
-                
-                # Get environment for this batch
-                env = self._batch_environment(tn_with_inputs, target_tag, copy=copy,
-                                          sum_over_batch=sum_over_batch, 
-                                          sum_over_output=sum_over_output)
-                batch_envs.append(env)
-            
-            return self._concat_batch_results(batch_envs)
-
-    def forward_with_target(self, tn: qt.TensorNetwork, inputs: List[qt.Tensor], 
-                           y: qt.Tensor, mode: str = 'dot', 
-                           sum_over_batch: bool = False):
+            result = self._concat_over_batches(
+                self._batch_forward_with_target,
+                input_generator,
+                tn = tn,
+                mode = mode,
+                sum_over_batch = sum_over_batch
+            )
+        return result
+    
+    def _batch_forward_with_target(self,
+                                   inputs: List[qt.Tensor], 
+                                   y: qt.Tensor,
+                                   tn: qt.TensorNetwork,
+                                   mode: str = 'dot',
+                                   sum_over_batch: bool = False
+                                ):
         """
         Forward pass coupled with target output y.
         
@@ -377,47 +350,48 @@ class BTN:
         
         return qt.Tensor(concat_data, inds=first_result.inds)
 
-    def _sum_over_batches(self, 
-                         batch_operation,
-                         inputs: any,
-                         *args, 
-                         **kwargs) -> qt.Tensor:
+    def _concat_over_batches(self, 
+                             batch_operation, 
+                             data_iterator, 
+                             *args, 
+                             **kwargs
+                         ):
         """
-        Generic method to apply a batch operation and sum results over all batches.
+        Iterates over data_iterator, collects results, and concatenates them.
+        """
+        results = []
         
-        This avoids storing all batch results in memory - sums on-the-fly.
-        
+        for batch_idx, batch_data in enumerate(data_iterator):
+            # Ensure proper unpacking (handle tuple vs single item)
+            inputs = batch_data if isinstance(batch_data, tuple) else (batch_data,)
+            
+            # Execute operation
+            batch_res = batch_operation(batch_idx, *inputs, *args, **kwargs)
+            results.append(batch_res)
+            
+        return self._concat_batch_results(results)
+
+    def _sum_over_batches(self, 
+                          batch_operation, 
+                          data_iterator, 
+                          *args, 
+                          **kwargs) -> qt.Tensor:
+        """
         Args:
-            batch_operation: Function that takes (batch_idx, inputs, *args, **kwargs)
-                           and returns a tensor for that batch
-            inputs: Input data prepared with prepare_inputs (list of tensors)
-            *args, **kwargs: Additional arguments to pass to batch_operation
-        
-        Returns:
-            Sum of all batch results
-            
-        Example:
-            def my_batch_op(batch_idx, inputs):
-                return self._batch_environment(..., batch_idx, ...)
-            
-            result = self._sum_over_batches(my_batch_op, inputs)
+            batch_operation: Function accepting (batch_idx, *unpacked_data, *args, **kwargs)
+            data_iterator: The generator property (e.g., loader.mu_sigma_y_batches)
         """
         result = None
         
-        # inputs is a list of tensors, get batch size from first one
-        num_batches = inputs[0].shape[0]
-        
-        # Iterate over batches
-        for batch_idx in range(num_batches):
-            # Compute for this batch
-            batch_result = batch_operation(batch_idx, inputs, *args, **kwargs)
+        for batch_data in data_iterator:
+            # Ensure data is a tuple for unpacking
+            inputs = batch_data if isinstance(batch_data, tuple) else (batch_data,)
             
-            # Sum into accumulator
-            if result is None:
-                result = batch_result
-            else:
-                result = result + batch_result
-        
+            # Unpack inputs into the operation (e.g., mu, sigma, y)
+            batch_result = batch_operation(*inputs, *args, **kwargs)
+            
+            result = batch_result if result is None else result + batch_result
+            
         return result
 
     def theta_block_computation(self, 
@@ -548,7 +522,7 @@ class BTN:
                                    node_tag: str,
                                    inputs: any) -> qt.Tensor:
 
-        tau_expectation = None
+        tau_expectation = self.q_tau.mean()
         sigma_env = None
         mu_outer_env = None
         theta = None
@@ -556,62 +530,71 @@ class BTN:
 
         for old_ind in original_inds:
             primed_ind = old_ind + '_prime'
-
             # Expand the original index into the desired diagonal pair
             # The original values are placed along the diagonal of (old_ind, primed_ind)
             theta = theta.new_ind_pair_diag(old_ind, old_ind, primed_ind)
         precision = tau_expectation * (sigma_env + mu_outer_env) + theta
-        return
+        return precision
 
-    def compute_environment_outer(self,
-                                   node_tag: str,
-                                   inputs: any) -> qt.Tensor:
+    def outer_operation(self, input_generator, tn, node_tag, sum_over_batches):
+        if sum_over_batches:
+            result = self._sum_over_batches(
+                self._batch_outer_operation,
+                input_generator,
+                tn = tn,
+                node_tag = node_tag,
+                sum_over_batches=sum_over_batches
+            )
+        else:
+            result = self._concat_over_batches(
+                self._batch_outer_operation,
+                input_generator,
+                tn = tn,
+                node_tag = node_tag,
+                sum_over_batches=sum_over_batches
+            )
+        return result
+    
+    def _batch_outer_operation(self, inputs, tn, node_tag, sum_over_batches: bool):
         """
         Compute the outer product of mu environment with itself, summed over batches:
         Σ_n (T_i μ x_n) ⊗ (T_i μ x_n)
-        
+    
         This is used in computing the precision update for variational inference.
         The environment is computed batch-by-batch, outer product computed, then summed.
-        
+    
         From theoretical model (Step 1, node update):
             Part of Σ⁻¹ computation requires: Σ_n (T_i μ x_n) ⊗ (T_i μ x_n)
-        
+    
         Args:
             node_tag: Tag identifying the node to exclude from environment
             inputs: Input data prepared with prepare_inputs (list of tensors with batch dim)
-        
+    
         Returns:
             Tensor representing Σ_n (T_i μ x_n) ⊗ (T_i μ x_n), with indices being
             the bonds of the node and their primed versions.
             Shape: (bond_a, bond_b, ..., bond_a_prime, bond_b_prime, ...)
         """
-        def batch_outer_operation(batch_idx, inputs):
-            # Contract mu network with ALL inputs (they have batch dimension)
-            tn_with_inputs = self.mu & inputs
-            
-            # Get environment for this batch (using the tag from mu network)
-            env = self._batch_environment(
-                tn_with_inputs,
-                node_tag,
-                sum_over_batch=False,  # Keep batch dim, will select batch_idx
-                sum_over_output=False  # Keep output dim for now
-            )
-            
-            # Select the specific batch (env has batch_dim 's')
-            # Extract just this batch from the environment
-            env_single = env.isel({self.batch_dim: batch_idx})
-            
-            # Prime indices (exclude output)
-            env_prime = self.prime_indices_tensor(env_single, exclude_indices=self.output_dimensions)
-            
-            # Outer product via tensor network (sums over shared output indices)
-            outer_tn = env_single & env_prime
-            batch_result = outer_tn.contract()
-            
-            return batch_result
+
+        env = self._batch_environment(
+            inputs,
+            tn,
+            target_tag=node_tag,
+            sum_over_batch=False,
+            sum_over_output=False
+        )
+      
+        # Prime indices (exclude output)
+        env_prime = self.prime_indices_tensor(env, exclude_indices=self.output_dimensions)
+        # Outer product via tensor network (sums over shared output indices)
+
+        env_inds = env.inds + env_prime.inds
+        outer_tn = env & env_prime
+        sample_dim = [self.batch_dim] if sum_over_batches else []
+        out_indices = sample_dim + [i for i in env_inds if i not in [self.batch_dim]]
+        batch_result = outer_tn.contract(output_inds = out_indices)
+        return batch_result
         
-        # Use generic batch summing
-        return self._sum_over_batches(batch_outer_operation, inputs)
     
     def prime_indices_tensor(self, 
                             tensor: qt.Tensor,

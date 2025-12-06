@@ -1,5 +1,6 @@
 # type: ignore
-import torch
+import itertools
+import math
 import numpy as np
 import quimb.tensor as qt
 from typing import List, Dict, Tuple, Any, Optional
@@ -14,12 +15,23 @@ class Inputs:
     """
         input is a list of lenght number of batches, where there is a dictionary of what the inputs are connecting for and which labels TODO: make a method that batches and labels auto.
     """
-    def __init__(self, input: List[any], outputs: List[any], outputs_labels: List[str],input_labels: List[str], batch_dim: str = "s"):
+    def __init__(self, inputs: List[any],
+                 outputs: List[any],
+                 outputs_labels: List[str],
+                 input_labels: List[str],
+                 batch_dim: str = "s",
+                 batch_size = None):
+
+        self.batch_size = inputs[0].shape[0] if batch_size is None else batch_size
+        self.samples = outputs[0].shape[0]
         self.batch_dim = batch_dim
-        self.repeated = len(list) == 1
+        self.repeated = (len(inputs) == 1)
         self.outputs_labels = outputs_labels
-        self.input_labels = input_labels if not self.repeatd else ["dummy_label"]
+        self.input_labels = input_labels
         print("It is assumed that the Inputs and outputs in list are ordered as labels")
+        raw_batches = self.batch_splits(inputs, outputs[0], self.batch_size)
+        self.mu_sigma_y_batches = self.create_node_from_batch_splits(raw_batches)
+        
         
     def batch_splits(self, xs, y, B):
         s = y.shape[0]
@@ -29,19 +41,20 @@ class Inputs:
                 inds=(self.batch_dim, *self.outputs_labels),
                 tags={'output'}
             )
-            batch ={f"{j}": x[i:i+B] for j, x in zip(self.input_labels,xs)} 
+            batch ={f"{j}": x[i:i+B] for j, x in zip(self.input_labels[:len(xs)],xs)} 
             yield batch, tensor
 
-    def create_node_from_batch_splits(self, batches):
-        for b in batches:
-            if self.repeated:
-                mubatch, sigmabatch = self.prepare_inputs_batch_repeated(b)
-            else:
-                mubatch, sigmabatch = self.prepare_inputs_batch(b)
-            yield mubatch, sigmabatch
-
-    def create_nodes():
-        pass
+    def create_node_from_batch_splits(self, batch_generator):
+            # Unpack the tuple yielded by batch_splits
+            for input_dict, y_tensor in batch_generator:
+            
+                # Process only the input dictionary
+                if self.repeated:
+                    mu, sigma = self.prepare_inputs_batch_repeated(input_dict)
+                else:
+                    mu, sigma = self.prepare_inputs_batch(input_dict)
+            
+                yield mu, sigma, y_tensor
 
     def prepare_inputs_batch(self, input_data: Dict[str, any]) -> List[qt.Tensor]:
         """
@@ -71,7 +84,8 @@ class Inputs:
             # Creates: x1(s, x1, data), x1_prime(s, x1_prime, data), x2(s, x2, data), x2_prime(s, x2_prime, data)
         """
         # Use input_indices from class (either provided or auto-detected in __init__)
-        tensors = []
+        tensors_mu = []
+        tensors_sigma = []
         for k,v in input_data.items():
             
             # Assert correct shape (must be 2D: batch x features)
@@ -83,8 +97,7 @@ class Inputs:
                 inds=(self.batch_dim, k),
                 tags={f'input_{k}'}
             )
-            tensors.append(tensor)
-            mu_inputs = tensors.copy()
+            tensors_mu.append(tensor)
             # If for_sigma, also create the prime version with the same data
             prime_idx = f"{k}_prime"
             tensor_prime = qt.Tensor(
@@ -92,10 +105,9 @@ class Inputs:
                 inds=(self.batch_dim, prime_idx),
                 tags={f'input_{prime_idx}'}
             )
-            tensors.append(tensor_prime)
-            sigma_inputs = tensors.copy()
+            tensors_sigma.append(tensor_prime)
         
-        return mu_inputs, sigma_inputs
+        return tensors_mu, tensors_mu + tensors_sigma
 
     def prepare_inputs_batch_repeated(self, input_data: Dict[str, any]) -> List[qt.Tensor]:
         """
@@ -137,7 +149,8 @@ class Inputs:
         batch_size, feature_dim = data.shape
         
         # Create tensors for each input index pointing to the SAME data
-        tensors = []
+        tensors_mu = []
+        tensors_sigma = []
         for input_idx in input_indices:
             # Create tensor with indices (batch_dim, input_idx)
             # All tensors point to the same data object - no copy needed
@@ -146,9 +159,7 @@ class Inputs:
                 inds=(self.batch_dim, input_idx),
                 tags={f'input_{input_idx}'}
             )
-            tensors.append(tensor)
-            
-            mu_inputs = tensors.copy()
+            tensors_mu.append(tensor)
             # If for_sigma, also create the prime version
             prime_idx = f"{input_idx}_prime"
             tensor_prime = qt.Tensor(
@@ -156,11 +167,70 @@ class Inputs:
                 inds=(self.batch_dim, prime_idx),
                 tags={f'input_{prime_idx}'}
             )
-            tensors.append(tensor_prime)
-            sigma_inputs = tensors.copy()
+            tensors_sigma.append(tensor_prime)
        
-        return mu_inputs, sigma_inputs
+        return tensors_mu, tensors_mu + tensors_sigma
+
+    @property
+    def data_mu(self):
+        """Yields only (mu, sigma), discarding y."""
+        for mu, _, _ in self.mu_sigma_y_batches:
+            yield mu
+
+    @property
+    def data_sigma(self):
+        """Yields only (mu, sigma), discarding y."""
+        for _, sigma, _ in self.mu_sigma_y_batches:
+            yield sigma
+
+    @property
+    def data_y(self):
+        """Yields only (mu, sigma), discarding y."""
+        for _, _, y in self.mu_sigma_y_batches:
+            yield y
+
+    @property
+    def data_mu_y(self):
+        """Yields only (mu, sigma), discarding y."""
+        for mu, _, y in self.mu_sigma_y_batches:
+            yield mu, y
+    # Usage:
+    # for mu, sigma in loader.inputs_only:
+    #     ...
+
+    def __str__(self):
+            """
+            Allows calling print(loader_instance). 
+            Peeks at the first batch to show structure without consuming the data.
+            """
+            # 1. Tee the generator: 'view' is for printing, 'save' keeps the data safe
+            gen_view, self.mu_sigma_y_batches = itertools.tee(self.mu_sigma_y_batches)
         
+            try:
+                # 2. Peek at the first batch
+                first_batch = next(gen_view)
+                mu, sigma, y = first_batch
+            
+                # 3. Format the info
+                mu_inds = [list(t.inds) for t in mu]
+                sigma_inds = [list(t.inds) for t in sigma]
+            
+                # 4. Build the string
+                header = (
+                    f"\n>>> InputLoader Summary (Batch Size: {self.batch_size}, Samples: {self.samples}, Batches Number: {math.ceil(self.samples/ self.batch_size)})\n"
+                    f"{'TYPE':<8} | {'SHAPE':<15} | {'INDICES'}\n"
+                    f"{'-'*60}\n"
+                )
+            
+                row_y = f"{'Target':<8} | {str(y.shape):<15} | {y.inds}\n"
+                row_mu = f"{'Mu':<8} | {str(mu[0].shape):<15} | {mu_inds} ... ({len(mu)} tensors)\n"
+                row_sig = f"{'Sigma':<8} | {str(sigma[0].shape):<15} | {sigma_inds} ... ({len(sigma)} tensors)"
+            
+                return header + row_y + row_mu + row_sig
+            
+            except StopIteration:
+                return "InputLoader (Empty/Exhausted)"        
+
 class BTNBuilder:
     """
     Builder class for constructing the Bayesian Tensor Network components.
@@ -191,6 +261,8 @@ class BTNBuilder:
         Constructs Gamma distributions with quimb.Tensor parameters.
         Tags: {ind}_alpha and {ind}_beta.
         """
+
+        # TODO: Wait It seems somenthing is wrong, we define p_alpha and q_alpha with concentration etc for VECTOR which is right, of lenght dimension. But doesnt GammaDistribution handles Single Gamma Distributions??? the Full distribution of the bond is the product of the Gamma distributions in its dimension! It doesnt seem that is what is happening. We need to check how distributions work.
         for ind, tids in all_inds_map.items():
             if ind in self.output_dimensions or ind == self.batch_dim:
                 continue
