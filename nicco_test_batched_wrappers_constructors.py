@@ -2,6 +2,7 @@ import numpy as np
 from tensor.builder import Inputs 
 from tensor.btn import BTN
 import quimb.tensor as qt
+np.random.seed = 100
 # ==========================================
 # SETUP: Generate Fake Data (100 samples)
 # ==========================================
@@ -121,7 +122,7 @@ print(" WOrkzz forward sigma")
 # print(model.mu.num_tensors)
 print(model.mse)
 
-model.fit(10)
+model.fit(5)
 
 forward_pass_mu = model.forward(model.mu, model.data.data_mu, False, True)
 # print(forward_pass_mu.data)
