@@ -1,9 +1,11 @@
 # type: ignore
+import torch
 import random
 from tensor.distributions import GammaDistribution, MultivariateGaussianDistribution
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
 import quimb.tensor as qt  # Assuming quimb.tensor is available
+torch.set_default_dtype(torch.float64)   # or torch.float64
 
 class Inputs:
     """
@@ -28,8 +30,6 @@ class Inputs:
         self.samples = outputs[0].shape[0]
         self.repeated = (len(inputs) == 1)
         
-        print("It is assumed that the Inputs and outputs in list are ordered as labels")
-
         # 2. Pre-compute all batches once and store them
         # Storage format: List[Tuple(mu_tensors, prime_tensors, y_tensor)]
         self.batches = self._create_batches()
@@ -51,7 +51,7 @@ class Inputs:
                 mu, prime = self.prepare_inputs_batch_repeated(input_dict)
             else:
                 mu, prime = self.prepare_inputs_batch(input_dict)
-          
+           
             batches.append((mu, prime, y_tensor))
             
         return batches
@@ -108,7 +108,6 @@ class Inputs:
         tensors_mu = []
         tensors_prime = []
         for k, v in input_data.items():
-            assert v.ndim == 2, f"Input data for '{k}' must be 2D, got {v.shape}"
             
             # Mu tensor
             tensor = qt.Tensor(data=v, inds=(self.batch_dim, k), tags={f'input_{k}'})
@@ -145,8 +144,6 @@ class Inputs:
         single_key = list(input_data.keys())[0]
         data = input_data[single_key]
         
-        assert data.ndim == 2, f"Input data must be 2D, got {data.shape}"
-        
         tensors_mu = []
         tensors_prime = []
         for input_idx in input_indices:
@@ -158,7 +155,7 @@ class Inputs:
             prime_idx = f"{input_idx}_prime"
             tensor_prime = qt.Tensor(data=data, inds=(self.batch_dim, prime_idx), tags={f'input_{prime_idx}'})
             tensors_prime.append(tensor_prime)
-       
+        
         return tensors_mu, tensors_prime
 
     def __str__(self):
@@ -227,18 +224,29 @@ class BTNBuilder:
             
             # --- Build Prior (p) ---
             # Tag convention: bondname_alpha, bondname_beta
-            p_alpha = qt.Tensor(data=np.ones(dim_size), inds=(ind,), tags={f"{ind}_alpha", "prior"})
-            p_beta = qt.Tensor(data=np.ones(dim_size), inds=(ind,), tags={f"{ind}_beta", "prior"})
+            alpha = qt.Tensor(data=torch.rand(dim_size, dtype = torch.float64), inds=(ind,), tags={f"{ind}_alpha", "prior"})
+            beta = qt.Tensor(data=torch.rand(dim_size, dtype = torch.float64), inds=(ind,), tags={f"{ind}_beta", "prior"})
+            p_alpha = alpha.copy()
+            p_beta = beta.copy()
             
             self.p_bonds[ind] = GammaDistribution(concentration=p_alpha, rate=p_beta, backend = self.backend)
             
             # --- Build Posterior (q) ---
-            q_alpha = qt.Tensor(data=np.ones(dim_size), inds=(ind,), tags={f"{ind}_alpha", "posterior"})
-            q_beta = qt.Tensor(data=np.ones(dim_size), inds=(ind,), tags={f"{ind}_beta", "posterior"})
+            alpha = qt.Tensor(data=torch.ones(dim_size, dtype = torch.float64)*2, inds=(ind,), tags={f"{ind}_alpha", "prior"})
+            beta = qt.Tensor(data=torch.ones(dim_size, dtype = torch.float64), inds=(ind,), tags={f"{ind}_beta", "prior"})
+            q_alpha =alpha.copy()
+            q_beta = beta.copy()
             
             self.q_bonds[ind] = GammaDistribution(concentration=q_alpha, rate=q_beta, backend =self.backend)
 
     def _construct_sigma_topology(self) -> qt.TensorNetwork:
+        """
+        Constructs the Sigma (Covariance) Tensor Network.
+        This network represents the covariance of the nodes.
+        It has a doubled structure (original indices + primed indices).
+        We initialize it to be close to an identity matrix (diagonal) on the 
+        non-output dimensions to ensure positive definiteness.
+        """
         sigma_tensors = []
         for tensor in self.mu:
             original_inds = tensor.inds
@@ -257,30 +265,45 @@ class BTNBuilder:
             sigma_inds = tuple(non_output_inds + non_output_primes + output_inds)
             
             shape_map = dict(zip(tensor.inds, tensor.shape))
-            new_shape = []
-            for ix in sigma_inds:
-                if ix.endswith('_prime') and ix not in shape_map:
-                    original_name = ix[:-6] 
-                else:
-                    original_name = ix
-                new_shape.append(shape_map[original_name])
             
-            # sigma_data = np.random.randn(*new_shape)
-            # print(new_shape)
-            # sigma_data = sigma_data
+            # 1. Calculate dimensions for non-output and output parts
+            non_out_dims = [shape_map[ix] for ix in non_output_inds]
+            out_dims = [shape_map[ix] for ix in output_inds]
+            
+            # 2. Total flattened size of non-output dimensions
+            #    (e.g., if indices are 'a', 'b' with sizes 2, 3 -> d_non_out = 6)
+            d_non_out = int(np.prod(non_out_dims))
+            
+            # 3. Create Identity Matrix for the non-output part
+            #    This ensures sigma[a, b, ..., a', b', ...] is non-zero ONLY if a==a' AND b==b' ...
+            eye_matrix = torch.eye(d_non_out)
+            
+            # 4. Reshape Identity back to tensor structure
+            #    (d_non_out, d_non_out) -> (dim_a, dim_b, ..., dim_a_prime, dim_b_prime, ...)
+            #    Note: This assumes the order in sigma_inds matches [non_outputs, non_outputs_prime, outputs]
+            eye_tensor = eye_matrix.reshape(non_out_dims + non_out_dims)
+            
+            # 5. Handle Output Dimensions (Broadcasting)
+            #    The covariance structure is usually repeated/shared across output dimensions for isotropic initialization
+            if out_dims:
+                # Expand dims for outputs
+                for _ in out_dims:
+                    eye_tensor = eye_tensor.unsqueeze(-1)
+                
+                # Expand values (broadcast)
+                final_shape = non_out_dims + non_out_dims + out_dims
+                sigma_data = eye_tensor.expand(final_shape).clone()
+            else:
+                sigma_data = eye_tensor.clone()
+            
+            # 6. Scaling
+            #    Scale to be small enough
+            new_shape_total_size = np.prod(sigma_data.shape)
+            scale = 1.0 / (new_shape_total_size * self.mu.num_tensors)
+            sigma_data = sigma_data * scale
+            
             sigma_tags = {f"{tag}" for tag in original_tags}
-            sigma_data = np.zeros(new_shape)
-
-            # Diagonal over non-output <-> non-output′ indices
-            for i, ix in enumerate(non_output_inds):
-                dim = shape_map[ix]
-                for d in range(dim):
-                    # index tuple: (…, d on ix, d on ix', …)
-                    idx = [slice(None)] * len(new_shape)
-                    idx[i] = d                         # position of ix
-                    idx[i + len(non_output_inds)] = d  # position of ix'
-                    sigma_data[tuple(idx)] = 1.0 / (np.prod(new_shape)*self.mu.num_tensors)
-
+            
             sigma_tensor = qt.Tensor(
                 data=sigma_data,
                 inds=sigma_inds,
@@ -314,7 +337,7 @@ class BTNBuilder:
             )
             
             prior_loc = tensor.copy()
-            prior_loc.modify(data=np.zeros_like(tensor.data))
+            prior_loc.modify(data=torch.zeros_like(tensor.data))
             
             self.p_nodes[node_key] = MultivariateGaussianDistribution(
                 loc=prior_loc,

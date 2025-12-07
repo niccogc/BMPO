@@ -2,22 +2,22 @@ import numpy as np
 from tensor.builder import Inputs 
 from tensor.btn import BTN
 import quimb.tensor as qt
-np.random.seed = 100
+import torch
+test = qt.Tensor(, inds = ["s, x1"])
+torch.set_default_dtype(torch.float64)   # or torch.float64
 # ==========================================
 # SETUP: Generate Fake Data (100 samples)
 # ==========================================
-N = 100
-x1 = np.random.randn(N, 3)
-x2 = np.random.randn(N, 3)
-x3 = np.random.randn(N, 3)
+N = 500
+x1 = torch.rand(N, 1)
+x2 = torch.rand(N, 1)
+# x3 = torch.randn(N, 3)
 
+y = (3*x1).sum(axis=1, keepdims=True)
 # Add a column of ones
-x1 = np.hstack([x1, np.ones((N, 1))])
-x2 = np.hstack([x2, np.ones((N, 1))])
-x3 = np.hstack([x3, np.ones((N, 1))])
-
+x1 = torch.cat([x1, torch.ones((N, 1))], dim = -1)
+x2 = torch.cat([x2, torch.ones((N, 1))], dim = -1)
 # y keeps shape (N, 1) as product over the original + ones
-y = (x1 * x2 * x3).sum(axis=1, keepdims=True)
 print(">>> RUNNING INPUT TESTS\n")
 
 # ==========================================
@@ -25,26 +25,25 @@ print(">>> RUNNING INPUT TESTS\n")
 # ==========================================
 print("--- Test 1: Standard Inputs ---")
 loader = Inputs(
-    inputs=[x1, x2, x3], 
+    inputs=[x1, x2], 
     outputs=[y], 
     outputs_labels=["y1"], 
-    input_labels=["x1", "x2", "x3"], 
+    input_labels=["x2", "x3"], 
     batch_size=32
 )
 
 def norm(shape):
-    rand = np.random.randn(*shape)
-    return rand/np.linalg.norm(rand)
+    rand = torch.randn(*shape)
+    return rand/torch.norm(rand)
 
-node1 = qt.Tensor(norm((4, 3)), inds=('x1', 'r2'), tags={'node1'})
-node2 = qt.Tensor(norm((4, 3, 5)), inds=('x2', 'r2', 'r3'), tags={'node2'})
-node3 = qt.Tensor(norm((4, 5, 1)), inds=('x3', 'r3','y1'), tags={'node3'})
-
-mu = qt.TensorNetwork([node1, node2, node3])
+# node1 = qt.Tensor(norm((4, 3)), inds=('x1', 'r2'), tags={'node1'})
+# node2 = qt.Tensor(norm((4, 3, 5)), inds=('x2', 'r2', 'r3'), tags={'node2'})
+node2 = qt.Tensor(norm((2, 3)), inds=('x2','r1'), tags={'node2'})
+node3 = qt.Tensor(norm((2, 3, 1)), inds=('x3','r1','y1'), tags={'node3'})
+mu = qt.TensorNetwork([node2, node3])
 
 model = BTN(mu, loader)
 print("="*50)
-print('\n Loader')
 print(loader)
 print("="*50)
 generator = model.data
@@ -71,7 +70,6 @@ print(" WOrkzz forward sigma")
 # print(precision.inds)
 # print("=*=*"*20)
 # print(model.sigma[tag].inds)
-
 # print("="*40)
 # previous_sigma = model.sigma[tag].copy()
 # model.update_sigma_node(tag)
@@ -120,9 +118,8 @@ print(" WOrkzz forward sigma")
 # print("DELTA TAU RATE")
 # print(-delta_r)
 # print(model.mu.num_tensors)
-print(model.mse)
 
-model.fit(5)
+model.fit(15)
 
 forward_pass_mu = model.forward(model.mu, model.data.data_mu, False, True)
-# print(forward_pass_mu.data)
+# print(forward_pass_mu)

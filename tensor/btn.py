@@ -4,9 +4,10 @@ from typing import List, Dict, Optional, Tuple
 from jax._src.ops.scatter import Index
 import quimb.tensor as qt
 import numpy as np
-
+import torch
 from tensor.builder import BTNBuilder, Inputs
 from tensor.distributions import GammaDistribution
+torch.set_default_dtype(torch.float32)   # or torch.float64
 
 # Tag for nodes that should not be trained
 NOT_TRAINABLE_TAG = "NT"
@@ -16,7 +17,8 @@ class BTN:
                  mu: qt.TensorNetwork,
                  data_stream: Inputs,
                  batch_dim: str = "s",
-                 not_trainable_nodes: List[str] = None
+                 not_trainable_nodes: List[str] = None,
+                 method = "cholesky"
                  ):
         """
         Bayesian Tensor Network.
@@ -30,6 +32,7 @@ class BTN:
 
             These nodes will be tagged with NOT_TRAINABLE_TAG ('NT').
         """
+        self.method = method
         self.mse = None
         self.sigma_forward = None
         self.mu = mu
@@ -452,7 +455,6 @@ class BTN:
         # Get expected values E[λ] = α/β for each bond from q_bonds (posterior)
         # These are quimb.Tensor objects with their respective indices
         bond_means = [self.q_bonds[bond_ind].mean() for bond_ind in bond_indices]
-        
         # Create TensorNetwork directly from list of tensors
         theta_tn = qt.TensorNetwork(bond_means)
         
@@ -477,9 +479,9 @@ class BTN:
             partial_mu = self._get_partial_trace(mu_node, i, bond_tag)
             partial_sigma = self._get_partial_trace(sigma_node, i, bond_tag)
             if update is None:
-                update= 0.5 * partial_mu + partial_sigma
+                update= 0.5 * (partial_mu + partial_sigma)
             else:
-                update+= 0.5* partial_mu + partial_sigma
+                update += 0.5* (partial_mu + partial_sigma)
         return p_rate + update
 
     def update_bond(self, bond_tag):
@@ -582,6 +584,7 @@ class BTN:
         theta = self.theta_block_computation(
             node_tag=node_tag,
         )
+
         original_inds = theta.inds # Get a copy of indices to iterate over
 
         for old_ind in original_inds:
@@ -617,6 +620,7 @@ class BTN:
             output_inds = mu_idx
         )
         tn = rhs & self.sigma[node_tag]
+        print(tn)
         mu_update = tn.contract(output_inds=mu_idx)
         mu_update.modify(tags=[node_tag])
         return mu_update * self.q_tau.mean()
@@ -710,6 +714,7 @@ class BTN:
         inv_tensor_data = inv_data.reshape(new_shape)
 
         return qt.Tensor(data=inv_tensor_data, inds=col_inds + row_inds, tags=tag)        
+
 
     def outer_operation(self, input_generator, tn, node_tag, sum_over_batches):
         if sum_over_batches:
@@ -809,14 +814,17 @@ class BTN:
         bonds = [i for i in self.mu.ind_map if i not in self.output_dimensions]
         nodes = list(self.mu.tag_map.keys())
         for i in range(epochs):
-            self.debug_print()
-            self.update_tau()
+            # self.debug_print()
             for node_tag in nodes:
                 self.update_sigma_node(node_tag)
                 self.update_mu_node(node_tag)
             for bond_tag in bonds:
                 self.update_bond(bond_tag)
-            print(self._calc_mu_mse())
+            self.update_tau()
+            ctau = self.q_tau.concentration
+            rtau = self.q_tau.rate
+            mse = self._calc_mu_mse()/self.data.samples
+            print(f"MSE {mse.data:.4f}, E[t] {self.get_tau_mean()}, C = {ctau}, R = {rtau:.4f}")
         return
 
     def debug_print(self, node_tag=None, bond_tag=None):

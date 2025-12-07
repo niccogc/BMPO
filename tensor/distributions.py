@@ -5,9 +5,10 @@ import torch.distributions as dist
 import quimb.tensor as qt
 import numpy as np
 from typing import List, Union, Optional, Any
+torch.set_default_dtype(torch.float32)   # or torch.float64
 
 
-def _extract_data(param: Any, dtype=torch.float32) -> torch.Tensor:
+def _extract_data(param: Any, dtype=torch.float64) -> torch.Tensor:
     """Helper to extract torch tensor data from potential quimb.Tensor."""
     if isinstance(param, qt.Tensor):
         # We assume the data inside quimb tensor might already be torch or numpy
