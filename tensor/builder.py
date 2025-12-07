@@ -51,7 +51,7 @@ class Inputs:
                 mu, prime = self.prepare_inputs_batch_repeated(input_dict)
             else:
                 mu, prime = self.prepare_inputs_batch(input_dict)
-            
+          
             batches.append((mu, prime, y_tensor))
             
         return batches
@@ -195,6 +195,7 @@ class BTNBuilder:
         self.mu = mu
         self.output_dimensions = output_dimensions
         self.batch_dim = batch_dim
+        self.backend = self.mu.backend
         
         self.p_bonds: Dict[str, GammaDistribution] = {}
         self.p_nodes: Dict[str, MultivariateGaussianDistribution] = {} 
@@ -217,7 +218,6 @@ class BTNBuilder:
         Tags: {ind}_alpha and {ind}_beta.
         """
 
-        # TODO: Wait It seems somenthing is wrong, we define p_alpha and q_alpha with concentration etc for VECTOR which is right, of lenght dimension. But doesnt GammaDistribution handles Single Gamma Distributions??? the Full distribution of the bond is the product of the Gamma distributions in its dimension! It doesnt seem that is what is happening. We need to check how distributions work.
         for ind, tids in all_inds_map.items():
             if ind in self.output_dimensions or ind == self.batch_dim:
                 continue
@@ -230,13 +230,13 @@ class BTNBuilder:
             p_alpha = qt.Tensor(data=np.ones(dim_size), inds=(ind,), tags={f"{ind}_alpha", "prior"})
             p_beta = qt.Tensor(data=np.ones(dim_size), inds=(ind,), tags={f"{ind}_beta", "prior"})
             
-            self.p_bonds[ind] = GammaDistribution(concentration=p_alpha, rate=p_beta)
+            self.p_bonds[ind] = GammaDistribution(concentration=p_alpha, rate=p_beta, backend = self.backend)
             
             # --- Build Posterior (q) ---
             q_alpha = qt.Tensor(data=np.ones(dim_size), inds=(ind,), tags={f"{ind}_alpha", "posterior"})
             q_beta = qt.Tensor(data=np.ones(dim_size), inds=(ind,), tags={f"{ind}_beta", "posterior"})
             
-            self.q_bonds[ind] = GammaDistribution(concentration=q_alpha, rate=q_beta)
+            self.q_bonds[ind] = GammaDistribution(concentration=q_alpha, rate=q_beta, backend =self.backend)
 
     def _construct_sigma_topology(self) -> qt.TensorNetwork:
         sigma_tensors = []
@@ -265,8 +265,21 @@ class BTNBuilder:
                     original_name = ix
                 new_shape.append(shape_map[original_name])
             
-            sigma_data = np.random.randn(*new_shape) * 0.01
+            # sigma_data = np.random.randn(*new_shape)
+            # print(new_shape)
+            # sigma_data = sigma_data
             sigma_tags = {f"{tag}" for tag in original_tags}
+            sigma_data = np.zeros(new_shape)
+
+            # Diagonal over non-output <-> non-output′ indices
+            for i, ix in enumerate(non_output_inds):
+                dim = shape_map[ix]
+                for d in range(dim):
+                    # index tuple: (…, d on ix, d on ix', …)
+                    idx = [slice(None)] * len(new_shape)
+                    idx[i] = d                         # position of ix
+                    idx[i + len(non_output_inds)] = d  # position of ix'
+                    sigma_data[tuple(idx)] = 1.0 / (np.prod(new_shape)*self.mu.num_tensors)
 
             sigma_tensor = qt.Tensor(
                 data=sigma_data,

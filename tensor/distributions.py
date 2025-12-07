@@ -1,4 +1,5 @@
 # type: ignore
+import jax as jnp
 import torch
 import torch.distributions as dist
 import quimb.tensor as qt
@@ -23,16 +24,31 @@ def _extract_data(param: Any, dtype=torch.float32) -> torch.Tensor:
     else:
         return torch.tensor(param, dtype=dtype)
 
-def _wrap_if_quimb(data: torch.Tensor, reference: Any) -> Any:
+def _wrap_if_quimb(data: torch.Tensor, reference: Any, backend: str) -> Any:
     """
     Wraps the result in a quimb.Tensor if the reference was a quimb.Tensor.
     Preserves indices.
     """
+    data = to_backend(data, backend)
     if isinstance(reference, qt.Tensor):
         # We store the torch tensor (potentially with grads) directly in the quimb tensor data
         return qt.Tensor(data=data, inds=reference.inds, tags=reference.tags)
     return data
 
+def to_backend(data, backend: str):
+    if backend == 'torch':
+        return data
+
+    # Convert to numpy first (handles CPU/GPU detachment)
+    arr = data.detach().cpu().numpy() if hasattr(data, 'detach') else data
+
+    if backend == 'numpy':
+        return arr
+    elif backend == 'jax':
+        import jax.numpy as jnp
+        return jnp.array(arr)
+    
+    raise ValueError(f"Unsupported backend: {backend}")
 
 class GammaDistribution:
     """
@@ -40,7 +56,7 @@ class GammaDistribution:
     Supports quimb.Tensor parameters and returns expectations as quimb.Tensors.
     """
     
-    def __init__(self, concentration, rate):
+    def __init__(self, concentration, rate, backend = 'torch'):
         """
         Initialize Gamma distribution.
         
@@ -48,6 +64,7 @@ class GammaDistribution:
             concentration: Shape parameter (alpha). Can be quimb.Tensor.
             rate: Rate parameter (beta). Can be quimb.Tensor.
         """
+        self.backend = backend
         self.concentration = concentration
         self.rate = rate
         self._distribution = None
@@ -74,12 +91,12 @@ class GammaDistribution:
         c_data = _extract_data(self.concentration)
         r_data = _extract_data(self.rate)
         res = c_data / r_data
-        return _wrap_if_quimb(res, self.concentration)
+        return _wrap_if_quimb(res, self.concentration, self.backend)
     
     def entropy(self):
         """Returns entropy. If inputs are quimb.Tensors, returns quimb.Tensor."""
         res = self.forward().entropy()
-        return _wrap_if_quimb(res, self.concentration)
+        return _wrap_if_quimb(res, self.concentration, self.backend)
     
     def expected_log(self, concentration: Optional[Any] = None, 
                      rate: Optional[Any] = None) -> Union[torch.Tensor, qt.Tensor]:
@@ -94,7 +111,7 @@ class GammaDistribution:
         
         # Use conc_obj as reference for indices
         ref = conc_obj if isinstance(conc_obj, qt.Tensor) else self.concentration
-        return _wrap_if_quimb(res, ref)
+        return _wrap_if_quimb(res, ref, self.backend)
 
     def expected_log_prob(self, concentration_p: Any, rate_p: Any) -> Union[torch.Tensor, qt.Tensor]:
         """Returns E_q[log p(X)] wrapped in quimb.Tensor if applicable."""
@@ -114,7 +131,7 @@ class GammaDistribution:
                  + (alpha_p - 1) * e_q_log_x 
                  - beta_p * e_q_x)
         
-        return _wrap_if_quimb(result, self.concentration)
+        return _wrap_if_quimb(result, self.concentration, self.backend)
 
 
 class MultivariateGaussianDistribution:
@@ -123,7 +140,7 @@ class MultivariateGaussianDistribution:
     Supports quimb.Tensor parameters.
     """
     
-    def __init__(self, loc, covariance_matrix=None, scale_tril=None):
+    def __init__(self, loc, covariance_matrix=None, scale_tril=None, backend='torch'):
         self.loc = loc
         self.covariance_matrix = covariance_matrix
         self.scale_tril = scale_tril
@@ -171,9 +188,7 @@ class MultivariateGaussianDistribution:
     
     def mean(self):
         """Returns the mean. If loc is a quimb.Tensor, returns it directly."""
-        if isinstance(self.loc, qt.Tensor):
-            return self.loc
-        return _extract_data(self.loc)
+        return self.loc
     
     def entropy(self):
         return self.forward().entropy()

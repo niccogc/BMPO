@@ -1,8 +1,7 @@
 # type: ignore
 import importlib
-
-from logging import ERROR
 from typing import List, Dict, Optional, Tuple
+from jax._src.ops.scatter import Index
 import quimb.tensor as qt
 import numpy as np
 
@@ -31,6 +30,8 @@ class BTN:
 
             These nodes will be tagged with NOT_TRAINABLE_TAG ('NT').
         """
+        self.mse = None
+        self.sigma_forward = None
         self.mu = mu
         self.output_dimensions = data_stream.outputs_labels
         self.batch_dim = batch_dim
@@ -55,8 +56,9 @@ class BTN:
         # q_bonds: Posteriors for edges (Gamma)
         # q_nodes: Posteriors for nodes (Gaussian)
         # sigma: The covariance TensorNetwork
-        self.p_tau = GammaDistribution(concentration = 1, rate = 1)
-        self.q_tau = GammaDistribution(concentration = 1, rate = 1)
+        self.backend = self.mu.backend
+        self.p_tau = GammaDistribution(concentration = 1, rate = 1, backend=self.backend)
+        self.q_tau = GammaDistribution(concentration = 1, rate = 1, backend=self.backend)
         (self.p_bonds, 
          self.p_nodes, 
          self.q_bonds, 
@@ -299,7 +301,7 @@ class BTN:
         elif mode == 'squared_error':
             # First compute forward using quimb
             target_inds = [self.batch_dim] + self.output_dimensions
-            forward_result = self._batch_forward(tn, inputs, output_inds=target_inds)
+            forward_result = self._batch_forward(inputs, tn, output_inds=target_inds)
             forward_result.transpose_(*target_inds)
             
             # Compute difference using quimb tensor subtraction
@@ -456,8 +458,76 @@ class BTN:
         
         # Contract to get the outer product (preserves all indices and labels)
         theta = theta_tn.contract()
-        
         return theta
+
+    def _get_concentration_update(self, bond_tag):
+        bond_concentration = self.p_bonds[bond_tag].concentration
+        num_trainable_nodes, _ = self.count_trainable_nodes_on_bond(bond_tag)
+        bond_dim = self.mu.inds_size([bond_tag])
+        update = bond_concentration +  bond_dim * num_trainable_nodes * 0.5
+        return update
+
+    def _get_rate_update(self, bond_tag):
+        p_rate = self.p_bonds[bond_tag].rate
+        _, tag_trainable_nodes = self.count_trainable_nodes_on_bond(bond_tag)
+        update = None
+        for i in tag_trainable_nodes:
+            mu_node = self.mu[i]**2
+            sigma_node = self._unprime_indices_tensor(self.sigma[i])
+            partial_mu = self._get_partial_trace(mu_node, i, bond_tag)
+            partial_sigma = self._get_partial_trace(sigma_node, i, bond_tag)
+            if update is None:
+                update= 0.5 * partial_mu + partial_sigma
+            else:
+                update+= 0.5* partial_mu + partial_sigma
+        return p_rate + update
+
+    def update_bond(self, bond_tag):
+        concentration_update = self._get_concentration_update(bond_tag)
+        rate_update = self._get_rate_update(bond_tag)
+        self.q_bonds[bond_tag].update_parameters(
+                        concentration = concentration_update,
+                        rate = rate_update
+                    )
+        return
+
+    def _calc_mu_mse(self, inputs= None):
+        if inputs is None:
+            inputs = self.data
+        mu_mse = self.forward_with_target(
+                    inputs.data_mu_y,
+                    self.mu,
+                    'squared_error',
+                    True,
+                    []
+                )
+        self.mse = mu_mse
+        return mu_mse
+
+    def _calc_sigma_forward(self, inputs = None):
+        if inputs is None:
+            inputs = self.data
+        sigma_forward = self.forward(self.sigma, inputs.data_sigma, True, True)
+        return sigma_forward
+    
+    def _get_tau_update(self):
+        concentration = self.p_tau.concentration + self.data.samples * 0.5
+        mse = self._calc_mu_mse()
+        sigma_f = self._calc_sigma_forward() 
+        rate = self.p_tau.rate + 0.5 * (mse + sigma_f)
+        return concentration, rate
+
+    def update_tau(self):
+        concentration, rate = self._get_tau_update()
+        self.q_tau.update_parameters(
+                            concentration = concentration,
+                            rate = rate
+                         )
+
+    def _get_partial_trace(self, node: qt.Tensor, node_tag, bond_tag):
+        theta = self.theta_block_computation(node_tag, [bond_tag])
+        tn = node & theta
+        return tn.contract(output_inds=[bond_tag])
 
     def count_trainable_nodes_on_bond(self, bond_ind: str) -> int:
         """
@@ -476,57 +546,13 @@ class BTN:
             # count_trainable_nodes_on_bond('a') returns 2
         """
         # Get tensor IDs that have this bond index using ind_map
-        tids_with_bond = self.mu.ind_map.get(bond_ind, set())
-        
-        # Count those that are trainable (don't have NT tag)
-        trainable_count = sum(
-            1 for tid in tids_with_bond 
+        tids = self.mu.ind_map.get(bond_ind, set())
+        trainable = [
+            self.mu.tensor_map[tid]
+            for tid in tids
             if NOT_TRAINABLE_TAG not in self.mu.tensor_map[tid].tags
-        )
-        
-        return trainable_count
-
-    def prime_indices(self, 
-                      node_tag: str, 
-                      exclude_indices: Optional[List[str]] = None,
-                      prime_suffix: str = "_prime") -> qt.Tensor:
-        """
-        Create a copy of a node tensor with all indices (except excluded ones) relabeled 
-        by appending a suffix.
-        
-        This is useful for creating 'primed' versions of tensors for operations like
-        computing overlaps or conjugate networks.
-        
-        Args:
-            node_tag: Tag identifying the node in the tensor network
-            exclude_indices: List of index labels to NOT relabel. 
-                           If None, no indices are excluded.
-            prime_suffix: Suffix to append to relabeled indices (default: "_prime")
-        
-        Returns:
-            New quimb.Tensor with relabeled indices (not inplace)
-            
-        Example:
-            # Node has indices ('a', 'b', 'c', 'out')
-            # prime_indices('node1', exclude_indices=['out'])
-            # Returns tensor with indices ('a_prime', 'b_prime', 'c_prime', 'out')
-        """
-        exclude_indices = exclude_indices or []
-        
-        # Get the node tensor
-        node = self.mu[node_tag]
-        
-        # Build reindex map: {old_ind: new_ind} for non-excluded indices
-        reindex_map = {
-            ind: f"{ind}{prime_suffix}"
-            for ind in node.inds
-            if ind not in exclude_indices
-        }
-        
-        # Reindex returns a new tensor (inplace=False by default)
-        primed_node = node.reindex(reindex_map)
-        
-        return primed_node
+        ]
+        return len(trainable), [t.tags for t in trainable]
 
     def get_tau_mean(self):
         return self.q_tau.mean()
@@ -536,6 +562,7 @@ class BTN:
                                ) -> qt.Tensor:
 
         tau_expectation = self.get_tau_mean()
+
         sigma_env = self.get_environment(
                          tn =self.sigma,
                          target_tag=node_tag ,
@@ -582,7 +609,6 @@ class BTN:
     def _get_mu_update(self, node_tag):
         mu_idx = self.mu[node_tag].inds
         self.mu.delete(node_tag)
-        print(mu_idx)
         rhs = self.forward_with_target(
             self.data.data_mu_y,
             self.mu,
@@ -590,19 +616,19 @@ class BTN:
             sum_over_batch = True,
             output_inds = mu_idx
         )
-        print("RHS")
-        print(rhs)
         tn = rhs & self.sigma[node_tag]
-        print("TN")
-        print(tn)
         mu_update = tn.contract(output_inds=mu_idx)
-        print("MU_UPDATE")
-        print(mu_update)
-        return mu_update
+        mu_update.modify(tags=[node_tag])
+        return mu_update * self.q_tau.mean()
     
     def update_sigma_node(self, node_tag):
         sigma_update = self._get_sigma_update(node_tag)
         self.update_node(self.sigma, sigma_update, node_tag)
+        return
+
+    def update_mu_node(self, node_tag):
+        mu_update = self._get_mu_update(node_tag)
+        self.update_node(self.mu, mu_update, node_tag)
         return
     
     def update_node(self, tn, tensor, node_tag):
@@ -610,9 +636,9 @@ class BTN:
         Updates the tensor network by replacing the node with the given tag
         with the new tensor.
         """
-        # Identify tensors to remove (collect first to avoid iterator modification issues)
-        # Remove existing
-        tn.delete(node_tag)
+
+        if node_tag in tn.tag_map:
+            tn.delete(node_tag)
         
         tn.add_tensor(tensor)
     
@@ -668,7 +694,6 @@ class BTN:
 
         # 3. Detect Backend
         backend_name, lib = self.get_backend(matrix_data)
-
         # 4. Invert
         if method == 'cholesky':
             inv_data = self.cholesky_invert(matrix_data, backend_name, lib)
@@ -736,7 +761,7 @@ class BTN:
       
         sample_dim = [self.batch_dim] if not sum_over_batches else []
         # Prime indices (exclude output)
-        env_prime = self.prime_indices_tensor(env, exclude_indices=self.output_dimensions+[self.batch_dim])
+        env_prime = self._prime_indices_tensor(env, exclude_indices=self.output_dimensions+[self.batch_dim])
         # Outer product via tensor network (sums over shared output indices)
 
         env_inds = env.inds + env_prime.inds
@@ -746,7 +771,7 @@ class BTN:
         return batch_result
         
     
-    def prime_indices_tensor(self, 
+    def _prime_indices_tensor(self, 
                             tensor: qt.Tensor,
                             exclude_indices: Optional[List[str]] = None,
                             prime_suffix: str = "_prime") -> qt.Tensor:
@@ -771,3 +796,49 @@ class BTN:
         
         return tensor.reindex(reindex_map)
   
+    def _unprime_indices_tensor(self, tensor: qt.Tensor, prime_suffix: str = "_prime") -> qt.Tensor:
+
+        reindex_map = {
+            ind: ind[:-len(prime_suffix)]
+            for ind in tensor.inds
+            if ind.endswith(prime_suffix)
+        }
+        return tensor.reindex(reindex_map)
+
+    def fit(self, epochs):
+        bonds = [i for i in self.mu.ind_map if i not in self.output_dimensions]
+        nodes = list(self.mu.tag_map.keys())
+        for i in range(epochs):
+            self.debug_print()
+            self.update_tau()
+            for node_tag in nodes:
+                self.update_sigma_node(node_tag)
+                self.update_mu_node(node_tag)
+            for bond_tag in bonds:
+                self.update_bond(bond_tag)
+            print(self._calc_mu_mse())
+        return
+
+    def debug_print(self, node_tag=None, bond_tag=None):
+        bonds = [i for i in self.mu.ind_map if i not in self.output_dimensions] if bond_tag is None else [bond_tag]
+        nodes = list(self.mu.tag_map.keys()) if node_tag is None else [node_tag]
+
+        print("="*30)
+        print(" CONCENTRATIONS ".center(30, "="))
+    
+        for b in bonds:
+            c = self.q_bonds[b].concentration
+            r = self.q_bonds[b].rate
+            print(f"{b}: conc={np.array2string(c.data, precision=3, separator=',')}", 
+                  f"rate={np.array2string(r.data, precision=3, separator=',')}")
+
+        print("="*30)
+        print(" MU & SIGMA SUMS ".center(30, "="))
+    
+        for n in nodes:
+            mu_val = self.mu[n].data.sum()
+            sigma_val = self.sigma[n].data.sum()
+            print(f"{n}: mu={mu_val:.3f}, sigma={sigma_val:.3f}")
+
+        print("="*30)
+
