@@ -15,8 +15,8 @@ def test_polynomial_learning():
     # ---------------------------------------------------------
     # 1. DATA GENERATION
     # ---------------------------------------------------------
-    N_SAMPLES = 500
-    BATCH_SIZE = 50
+    N_SAMPLES = 5000
+    BATCH_SIZE = 500
     
     # Generate X in range [-1, 1]
     # We use a slightly wider range to test generalization within the interval
@@ -28,7 +28,7 @@ def test_polynomial_learning():
     y_raw = 2 * (x_raw**3) - (x_raw**2) + 0.5 * x_raw + 0.2
     
     # Add small noise
-    y_raw += 0.01 * torch.randn_like(y_raw)
+    y_raw += 0.1 * torch.randn_like(y_raw)
 
     # ---------------------------------------------------------
     # 2. FEATURE ENGINEERING (Add constant)
@@ -46,6 +46,7 @@ def test_polynomial_learning():
     # We pass ONE input tensor but THREE input labels.
     # The Inputs class handles repetition automatically.
     # This simulates feeding the same x vector into 3 different MPS sites.
+    # 
     input_labels = ["x1", "x2", "x3"]
     
     loader = Inputs(
@@ -62,6 +63,7 @@ def test_polynomial_learning():
     # ---------------------------------------------------------
     # 3 Nodes. Physical dimension = 2 (feature dim).
     # Bond dimension = 3 (sufficient for cubic poly).
+
     D_bond = 4 
     D_phys = 2
     
@@ -72,8 +74,8 @@ def test_polynomial_learning():
 
     # Node 1: Input 'x1', Bond 'b1'
     t1 = qt.Tensor(
-        data=init_weights((D_phys, D_bond)), 
-        inds=('x1', 'b1'), 
+        data=init_weights((D_phys, D_bond, D_bond)), 
+        inds=('x1', 'b1', 'b3'), 
         tags={'Node1'}
     )
     
@@ -87,8 +89,8 @@ def test_polynomial_learning():
     # Node 3: Bond 'b2', Input 'x3', Output 'y'
     # Output dimension is 1 (scalar regression)
     t3 = qt.Tensor(
-        data=init_weights((D_bond, D_phys, 1)), 
-        inds=('b2', 'x3', 'y'), 
+        data=init_weights((D_bond, D_phys, D_bond, 1)), 
+        inds=('b2', 'x3', 'b3', 'y'), 
         tags={'Node3'}
     )
     
