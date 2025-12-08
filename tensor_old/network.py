@@ -3,12 +3,12 @@ import string
 from torch import nn
 import string
 from collections import deque
-from tensor.node import TensorNode
+from tensor_old.node import TensorNode
 from tqdm.auto import tqdm
 import time
 import numpy as np
 from scipy.sparse.linalg import LinearOperator, cg
-from tensor.utils import EinsumLabeler
+from tensor_old.utils import EinsumLabeler
 
 class TensorNetwork:
     def __init__(self, input_nodes, main_nodes, train_nodes=None, output_labels=('s',), sample_dim='s'):

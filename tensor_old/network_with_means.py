@@ -3,12 +3,12 @@ import string
 from torch import nn
 import string
 from collections import deque
-from tensor.node import TensorNode
+from tensor_old.node import TensorNode
 from tqdm.auto import tqdm
 import time
 import numpy as np
 from scipy.sparse.linalg import LinearOperator, cg
-from tensor.utils import EinsumLabeler
+from tensor_old.utils import EinsumLabeler
 
 class TensorNetwork:
     def __init__(self, input_nodes, main_nodes, train_nodes=None, output_labels=('s',), sample_dim='s'):
@@ -208,8 +208,8 @@ class TensorNetwork:
         einsum_b = f"{J_ein1},{d_loss_ein}->{J_out1}"
 
         # Compute einsum operations
-        A = torch.einsum(einsum_A, J.tensor.conj(), J.tensor, hessian)
-        b = torch.einsum(einsum_b, J.tensor.conj(), grad)
+        A = torch.einsum(einsum_A, J.tensor_old.conj(), J.tensor, hessian)
+        b = torch.einsum(einsum_b, J.tensor_old.conj(), grad)
 
         return A, b
 
@@ -302,11 +302,11 @@ class TensorNetwork:
         elif method.lower() == 'ridge_exact':
             ##A_f.diagonal(dim1=-2, dim2=-1).add_(2 * eps)
             A_f = A_f + (2 * eps) * torch.eye(A_f.shape[-1], dtype=A_f.dtype, device=A_f.device)
-            b_f = b_f + (2 * eps) * node.tensor.flatten()
+            b_f = b_f + (2 * eps) * node.tensor_old.flatten()
             x = torch.linalg.solve(A_f, -b_f)
         elif method.lower().startswith('ridge_cholesky'):
             A_f = A_f + (2 * eps) * torch.eye(A_f.shape[-1], dtype=A_f.dtype, device=A_f.device)
-            b_f = b_f + (2 * eps) * node.tensor.flatten()
+            b_f = b_f + (2 * eps) * node.tensor_old.flatten()
 
             L = torch.linalg.cholesky(A_f)
             x = torch.cholesky_solve(-b_f.unsqueeze(-1), L)
@@ -626,7 +626,7 @@ class TensorNetwork:
 
         # Permute so that left dims are first, right bond last
         perm_order = left_nonbond_indices + right_bond_indices
-        A_permuted = node.tensor.permute(perm_order)
+        A_permuted = node.tensor_old.permute(perm_order)
 
         # Flatten into a 2D matrix: (left combined, right bond)
         original_shape = A_permuted.shape
@@ -664,7 +664,7 @@ class TensorNetwork:
         # Permute so that left bonds come last (we flip the order to simulate RQ)
         # One strategy is to bring the nonbond dims first, then the bond dims.
         perm_order = right_nonbond_indices + left_bond_indices
-        A_permuted = node.tensor.permute(perm_order)
+        A_permuted = node.tensor_old.permute(perm_order)
 
         # Save original shape to later reshape Q back.
         original_shape = A_permuted.shape

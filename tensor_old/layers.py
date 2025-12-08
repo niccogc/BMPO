@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from tensor.network import TensorNetwork, CPDNetwork
-from tensor.node import TensorNode
+from tensor_old.network import TensorNetwork, CPDNetwork
+from tensor_old.node import TensorNode
 from collections import defaultdict
-from tensor.data_compression import train_concat
+from tensor_old.data_compression import train_concat
 
 class MainNodeLayer(nn.Module):
     def __init__(self, N, r, f, output_shape=tuple(), down_label='p', horizontal_label='r{0}', constrict_bond=True, perturb=False, dtype=None):
@@ -1074,7 +1074,7 @@ class TensorConvolutionGridTrainLayer(TensorNetworkLayer):
         tensor_network = TensorNetwork(x_nodes, main_nodes, self.nodes, output_labels=self.labels)
         super(TensorConvolutionGridTrainLayer, self).__init__(tensor_network)
 
-from tensor.node import CPDTensorNode
+from tensor_old.node import CPDTensorNode
 
 class CPD(TensorNetworkLayer):
     def __init__(self, num_carriages, bond_dim, input_features, output_shape=tuple(), ring=False, squeeze=True):

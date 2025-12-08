@@ -609,7 +609,7 @@ class BTN:
             sigma_node.new_ind(i, self.mu.ind_size(i))
         return sigma_node
 
-    def _get_mu_update(self, node_tag):
+    def _get_mu_update(self, node_tag, debug = False):
         mu_idx = self.mu[node_tag].inds
         self.mu.delete(node_tag)
         rhs = self.forward_with_target(
@@ -619,11 +619,21 @@ class BTN:
             sum_over_batch = True,
             output_inds = mu_idx
         )
+        relabel_map = {}
+        for ind in mu_idx:
+            if ind in self.output_dimensions:
+                pass 
+            else:
+                relabel_map[ind] = ind + '_prime'
+        rhs = rhs.reindex(relabel_map)
+        rhs = rhs * self.q_tau.mean()
         tn = rhs & self.sigma[node_tag]
-        print(tn)
+
         mu_update = tn.contract(output_inds=mu_idx)
         mu_update.modify(tags=[node_tag])
-        return mu_update * self.q_tau.mean()
+        if debug:
+            return mu_update, rhs, self.sigma[node_tag]
+        return mu_update
     
     def update_sigma_node(self, node_tag):
         sigma_update = self._get_sigma_update(node_tag)
@@ -678,43 +688,41 @@ class BTN:
 
     def invert_ordered_tensor(self, tensor, index_bases, method='cholesky', tag=None):
         """
-        Args:
-            tensor: quimb.Tensor or TensorNetwork
-            index_bases: list of str (the base index names, e.g. ['k', 'a'])
-            method: 'direct' or 'cholesky'
+        Inverts a tensor treating 'index_bases' as the column indices 
+        and 'index_bases + _prime' as the row indices.
         """
         if tag is None:
             tag = tensor.tags
-        # 1. Sort indices for consistent ordering
-        # We define rows as the base indices, cols as base + '_prime'
+            
+        # 1. Sort indices for consistent ordering (Block Layout)
+        # col_inds = Unprimes (e.g., 'b1', 'x2')
+        # row_inds = Primes   (e.g., 'b1_prime', 'x2_prime')
         col_inds = sorted(index_bases)
         row_inds = [i + '_prime' for i in col_inds]
-     # 2. Transpose Tensor to (Row_Inds, Col_Inds)
-        # This orders the data contiguously in memory for the matrix view
-        tensor = tensor.transpose(*row_inds, *col_inds)
-        # 2. Extract Matrix
-        # to_dense(rows, cols) handles the random internal ordering automatically
-        matrix_data = tensor.to_dense(row_inds, col_inds)
 
-        # 3. Detect Backend
+        # 2. Extract Matrix: (Rows=Unprimes, Cols=Primes)
+        # We explicitly map Unprimes to Rows to match standard linear algebra 
+        # A * x = b  (A has rows matching x's indices)
+        matrix_data = tensor.to_dense(col_inds, row_inds)
+
+        # 3. Detect Backend & Invert
         backend_name, lib = self.get_backend(matrix_data)
-        # 4. Invert
+        
         if method == 'cholesky':
             inv_data = self.cholesky_invert(matrix_data, backend_name, lib)
         else:
-            # Standard inversion
             if backend_name in ('torch', 'jax', 'numpy'):
                 inv_data = lib.linalg.inv(matrix_data)
             else:
                 raise ValueError(f"Unknown backend '{backend_name}' for inversion.")
 
-        # sizes = [tensor.ind_size(i) for i in col_inds + row_inds]
+        # 4. Reshape & Return
+        # The matrix 'inv_data' is (Unprimes, Primes). 
+        # We must assign indices in that exact order.
         new_shape = tuple(tensor.ind_size(i) for i in col_inds + row_inds)
-    
         inv_tensor_data = inv_data.reshape(new_shape)
 
-        return qt.Tensor(data=inv_tensor_data, inds=col_inds + row_inds, tags=tag)        
-
+        return qt.Tensor(data=inv_tensor_data, inds=col_inds + row_inds, tags=tag)
 
     def outer_operation(self, input_generator, tn, node_tag, sum_over_batches):
         if sum_over_batches:

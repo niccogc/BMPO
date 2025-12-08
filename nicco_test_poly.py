@@ -120,7 +120,7 @@ def test_polynomial_learning():
     # ---------------------------------------------------------
     # 6. EVALUATION
     # ---------------------------------------------------------
-    final_mse = model._calc_mu_mse().item()
+    final_mse = model._calc_mu_mse().item()/model.data.samples
     print("\n" + "-"*30)
     print(f"Final MSE: {final_mse:.6f}")
     

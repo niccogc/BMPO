@@ -10,9 +10,9 @@ For a dimension of size N, there are N Gamma distributions (one per index).
 """
 
 import torch
-from tensor.node import TensorNode
-from tensor.network import TensorNetwork
-from tensor.probability_distributions import GammaDistribution, ProductDistribution
+from tensor_old.node import TensorNode
+from tensor_old.network import TensorNetwork
+from tensor_old.probability_distributions import GammaDistribution, ProductDistribution
 from typing import Dict, List, Optional, Set, Tuple, Union, Any, Sequence, Set, Tuple, Union, Any, Set, Tuple, Union
 
 

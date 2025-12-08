@@ -298,8 +298,13 @@ class BTNBuilder:
             
             # 6. Scaling
             #    Scale to be small enough
+            # Just for testing
+            shape_len = len(sigma_data.shape)
+            if len(sigma_data.shape) == 4:
+                shape_len = 6
+            avg_rank = torch.tensor(sigma_data.shape, dtype=torch.float64).prod().pow(1.0 / shape_len).item()
             new_shape_total_size = np.prod(sigma_data.shape)
-            scale = 1.0 / (new_shape_total_size * self.mu.num_tensors)
+            scale = 1.0 / (avg_rank * self.mu.num_tensors)
             sigma_data = sigma_data * scale
             
             sigma_tags = {f"{tag}" for tag in original_tags}

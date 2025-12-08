@@ -6,8 +6,8 @@ following the Tensor Train (TT/MPS) pattern.
 """
 
 import torch
-from tensor.node import TensorNode
-from tensor.bayesian_mpo import BayesianMPO
+from tensor_old.node import TensorNode
+from tensor_old.bayesian_mpo import BayesianMPO
 from typing import Tuple, Optional, List
 
 

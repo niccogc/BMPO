@@ -4,9 +4,9 @@ from functools import partial
 import torch
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.metrics import r2_score, root_mean_squared_error
-from tensor.layers import TensorTrainLayer, TensorTrainLinearLayer, TensorNetworkLayer, CPDLayer
-from tensor.network import SumOfNetworks
-from tensor.bregman import SquareBregFunction
+from tensor_old.layers import TensorTrainLayer, TensorTrainLinearLayer, TensorNetworkLayer, CPDLayer
+from tensor_old.network import SumOfNetworks
+from tensor_old.bregman import SquareBregFunction
 
 def root_mean_squared_error_torch(y_true, y_pred):
     y_true = y_true.cpu().numpy()

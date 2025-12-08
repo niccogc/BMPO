@@ -12,10 +12,10 @@ Contains:
 # 
 # TODO: Sigma initialization should depend on all modes not only on the ranks.
 import torch
-from tensor.node import TensorNode
-from tensor.network import TensorNetwork
-from tensor.bmpo import BMPONetwork
-from tensor.probability_distributions import (
+from tensor_old.node import TensorNode
+from tensor_old.network import TensorNetwork
+from tensor_old.bmpo import BMPONetwork
+from tensor_old.probability_distributions import (
     GammaDistribution, 
     MultivariateGaussianDistribution,
     ProductDistribution
@@ -672,7 +672,7 @@ class BayesianMPO:
         
         This is J^T @ J summed over samples, without hessian weighting.
         """
-        from tensor.utils import EinsumLabeler
+        from tensor_old.utils import EinsumLabeler
         
         # Get Jacobian
         J = network.compute_jacobian_stack(node).copy()
@@ -872,7 +872,7 @@ class BayesianMPO:
         self, 
         sigma_inv: torch.Tensor, 
         rhs: torch.Tensor,
-        method: str = 'inverse'
+        method: str = 'cholesky'
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Solve variational system: Σ^⁻¹ μ = rhs, and compute Σ = (Σ^⁻¹)^⁻¹.
@@ -900,7 +900,7 @@ class BayesianMPO:
         block_idx: int, 
         X: torch.Tensor, 
         y: torch.Tensor
-    ) -> None:
+    ) -> Dict:
         """
         Variational update for a block's parameters (μ and Σ).
         
@@ -1004,7 +1004,18 @@ class BayesianMPO:
         # Reset stacks after update
         self.mu_mpo.reset_stacks()
         self.sigma_mpo.reset_stacks()
+        dict =  {
+                "tau_mean": E_tau,
+                "env": sum_y_dot_J_mu_flat,
+                "precision": sigma_inv,
+                "mu_new": mu_new,
+                "rhs": rhs,
+                "J_sigma": sum_J_sigma, # Environment from Sigma
+                "J_mu_outer": J_mu_outer_flat # Environment from Mu
+            }
+        return dict
     
+
     def update_tau(
         self, 
         alpha: Optional[torch.Tensor] = None, 
