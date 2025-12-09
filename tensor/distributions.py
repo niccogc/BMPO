@@ -178,14 +178,19 @@ class MultivariateGaussianDistribution:
                 
         return loc_data, cov_data, scale_data
     
-    def forward(self):
-        if self._distribution is None:
-            loc, cov, scale = self._get_params()
-            if scale is not None:
-                self._distribution = dist.MultivariateNormal(loc, scale_tril=scale)
-            else:
-                self._distribution = dist.MultivariateNormal(loc, covariance_matrix=cov)
-        return self._distribution
+    def forward(self, loc=None, cov=None, scale=None):
+
+        # if self._distribution is None:
+        #     loc, cov, scale = self._get_params()
+        #     if scale is not None:
+        #         self._distribution = dist.MultivariateNormal(loc, scale_tril=scale)
+        #     else:
+        #         print(cov)
+        #         self._distribution = dist.MultivariateNormal(loc, covariance_matrix=cov)
+        print(cov)
+        if loc is None:
+            loc = self.loc.data
+        return dist.MultivariateNormal(loc = loc, covariance_matrix=cov)
     
     def mean(self):
         """Returns the mean. If loc is a quimb.Tensor, returns it directly."""

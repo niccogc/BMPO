@@ -1,4 +1,5 @@
 # type: ignore
+from torch.distributions import kl_divergence
 import importlib
 from typing import List, Dict, Optional, Tuple
 from jax._src.ops.scatter import Index
@@ -67,6 +68,41 @@ class BTN:
          self.q_bonds, 
          self.q_nodes, 
          self.sigma) = builder.build_model()
+
+    def compute_bond_kl(self):
+        sum = 0
+        for i in self.p_bonds:
+            p = self.p_bonds[i].forward()
+            q = self.q_bonds[i].forward()
+            kl = kl_divergence(q, p).sum()
+            print(f"Bond {i}")
+            print(kl)
+            sum += kl
+        return sum
+
+    def compute_node_kl(self):
+        sum = 0
+        for i in self.p_nodes:
+            idx = self.mu[i].inds
+            means = [self.p_bonds[i].mean() for i in idx if i not in self.output_dimensions]
+
+            tn = qt.TensorNetwork(means)
+            covariance = tn.contract(output_inds = idx)
+            p = self.p_nodes[i].forward(cov= torch.diag(covariance.data.view(-1)))
+            mu = self.mu[i]
+            sigma = self.sigma[i]
+            q = self.q_nodes[i].forward(loc = self.mu[i].data, cov = self.sigma[i].data)
+            kl = kl_divergence(q, p).sum()
+            print(f"Nodes {i}, idx {idx}")
+            print(kl)
+            sum += kl
+        return sum
+
+    def compute_kl(self):
+        tau_kl = kl_divergence(self.q_tau.forward(), self.p_tau.forward())
+        print("tau kl")
+        print(tau_kl)
+        return
 
     def _copy_data(self, data):
         """Helper to copy data arrays, backend-agnostic."""
