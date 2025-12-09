@@ -131,7 +131,7 @@ class TNModel(nn.Module):
 DIM_PATCHES = xinp_train.shape[1] # 50
 DIM_PIXELS = xinp_train.shape[2]  # 17
 
-bond_dim = 8
+bond_dim = 16
 
 # Helper for init
 def init_data(*shape):
@@ -171,7 +171,7 @@ criterion = nn.CrossEntropyLoss()
 # --- Training Loop ---
 
 history = {'epoch': [], 'loss': [], 'accuracy': []}
-epochs = 5
+epochs = 15
 
 print(f"Model initialized on {device}. Input: {DIM_PATCHES} Patches x {DIM_PIXELS} Pixels.")
 
