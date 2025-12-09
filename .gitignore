@@ -1,4 +1,5 @@
 # UV virtual environment
+data
 .venv/
 __pycache__/
 *.py[cod]
