@@ -69,40 +69,323 @@ class BTN:
          self.q_nodes, 
          self.sigma) = builder.build_model()
 
-    def compute_bond_kl(self):
-        sum = 0
+    def compute_bond_kl(self, verbose=False):
+        """
+        Compute KL divergence for all bond (edge) distributions.
+        
+        Args:
+            verbose: If True, print individual bond KL values
+            
+        Returns:
+            Total bond KL divergence
+        """
+        total_kl = 0
         for i in self.p_bonds:
             p = self.p_bonds[i].forward()
             q = self.q_bonds[i].forward()
             kl = kl_divergence(q, p).sum()
-            print(f"Bond {i}")
-            print(kl)
-            sum += kl
-        return sum
+            if verbose:
+                print(f"Bond {i}: KL = {kl:.4f}")
+            total_kl += kl
+        return total_kl
 
-    def compute_node_kl(self):
-        sum = 0
+    def compute_node_kl(self, verbose=False, debug=False):
+        """
+        Compute KL divergence between q (posterior) and p (prior) for all nodes.
+        
+        Args:
+            verbose: If True, print individual node KL values
+            debug: If True, print detailed debugging information
+        
+        Key insight:
+        - mu structure: [variational_indices] + [output_indices]
+        - sigma structure: [variational_indices] + [variational_indices_prime] + [output_indices]
+        - For each output class, we have a separate posterior q(θ | output_class)
+        - Prior p(θ) is the SAME for all output classes (it's independent of output)
+        - Total KL = Σ_{output_class} KL[q(θ[variational] | class) || p(θ[variational])]
+        """
+        total_kl = 0
         for i in self.p_nodes:
-            idx = self.mu[i].inds
-            means = [self.p_bonds[i].mean() for i in idx if i not in self.output_dimensions]
-
-            tn = qt.TensorNetwork(means)
-            covariance = tn.contract(output_inds = idx)
-            p = self.p_nodes[i].forward(cov= torch.diag(covariance.data.view(-1)))
-            mu = self.mu[i]
-            sigma = self.sigma[i]
-            q = self.q_nodes[i].forward(loc = self.mu[i].data, cov = self.sigma[i].data)
-            kl = kl_divergence(q, p).sum()
-            print(f"Nodes {i}, idx {idx}")
-            print(kl)
-            sum += kl
-        return sum
+            mu_idx = self.mu[i].inds
+            sigma_idx = self.sigma[i].inds
+            mu_shape = self.mu[i].shape
+            
+            if debug:
+                print(f"\n{'='*60}")
+                print(f"DEBUG: Node {i}")
+                print(f"{'='*60}")
+                print(f"mu_idx: {mu_idx}")
+                print(f"mu_shape: {mu_shape}")
+                print(f"sigma_idx: {sigma_idx}")
+            
+            # Separate output and variational indices
+            output_inds = [ind for ind in mu_idx if ind in self.output_dimensions]
+            variational_inds = [ind for ind in mu_idx if ind not in self.output_dimensions]
+            
+            if debug:
+                print(f"output_inds: {output_inds}")
+                print(f"variational_inds: {variational_inds}")
+            
+            # Get shape for each index
+            shape_map = dict(zip(self.mu[i].inds, self.mu[i].shape))
+            
+            # Build prior covariance diagonal FOR VARIATIONAL INDICES ONLY
+            cov_list = []
+            for ind in variational_inds:
+                bond_mean = self.p_bonds[ind].mean()
+                cov_list.append(bond_mean.data if isinstance(bond_mean, qt.Tensor) else bond_mean)
+            
+            # Compute outer product of all covariance components to get full diagonal
+            if cov_list:
+                full_cov = cov_list[0].flatten()
+                for cov_component in cov_list[1:]:
+                    full_cov = (full_cov.unsqueeze(-1) * cov_component.flatten().unsqueeze(0)).flatten()
+            else:
+                # No variational indices - this shouldn't happen in practice
+                d_total = int(np.prod(mu_shape))
+                full_cov = torch.ones(d_total, dtype=torch.float32)
+            
+            if debug:
+                print(f"Prior covariance diagonal shape: {full_cov.shape}")
+                print(f"Prior covariance diagonal (first 5): {full_cov[:5]}")
+            
+            # Create diagonal covariance matrix for prior p(theta)
+            # Prior has zero mean and diagonal covariance from bond priors (same for all output classes)
+            prior_cov_diag = torch.diag(full_cov)
+            prior_loc = torch.zeros(len(full_cov), dtype=torch.float32)
+            p = self.p_nodes[i].forward(loc=prior_loc, cov=prior_cov_diag)
+            
+            if debug:
+                print(f"Prior p: mean shape = {prior_loc.shape}, cov shape = {prior_cov_diag.shape}")
+            
+            # Q distribution: posterior q(theta | data, output_class)
+            # Calculate dimensions
+            d_var = int(np.prod([shape_map[ind] for ind in variational_inds])) if variational_inds else 1
+            d_out = int(np.prod([shape_map[ind] for ind in output_inds])) if output_inds else 1
+            
+            if debug:
+                print(f"d_var (variational dims product): {d_var}")
+                print(f"d_out (output dims product): {d_out}")
+            
+            # Reshape mu and sigma
+            # mu has shape [variational_inds, output_inds]
+            # Need to ensure proper ordering
+            mu_data = self.mu[i].data
+            sigma_data = self.sigma[i].data
+            
+            if debug:
+                print(f"mu_data original shape: {mu_data.shape}")
+                print(f"sigma_data original shape: {sigma_data.shape}")
+            
+            # Reshape: put variational first, output last
+            mu_reshaped = mu_data.reshape(d_var, d_out)  # [variational, output]
+            sigma_reshaped = sigma_data.reshape(d_var, d_var, d_out)  # [var, var, out]
+            
+            if debug:
+                print(f"mu_reshaped shape: {mu_reshaped.shape}")
+                print(f"sigma_reshaped shape: {sigma_reshaped.shape}")
+            
+            # Iterate over each output class and sum KL divergences
+            node_kl = 0
+            for out_idx in range(d_out):
+                # Extract mean and covariance for this output class
+                mu_class = mu_reshaped[:, out_idx]  # [d_var]
+                sigma_class = sigma_reshaped[:, :, out_idx]  # [d_var, d_var]
+                
+                if debug:
+                    print(f"\n  Output class {out_idx}:")
+                    print(f"  q: mu_class shape = {mu_class.shape}, sigma_class shape = {sigma_class.shape}")
+                    print(f"  q: mu_class (first 3) = {mu_class[:3]}")
+                
+                # Create posterior for this output class
+                q_class = self.q_nodes[i].forward(loc=mu_class, cov=sigma_class)
+                
+                # Compute KL for this class
+                kl_class = kl_divergence(q_class, p)
+                
+                if debug:
+                    print(f"  KL for class {out_idx}: {kl_class:.6f}")
+                
+                node_kl += kl_class
+            
+            if debug or verbose:
+                print(f"\nNode {i}: Total KL = {node_kl:.4f} (summed over {d_out} output classes)")
+            
+            total_kl += node_kl
+            
+        return total_kl
 
     def compute_kl(self):
         tau_kl = kl_divergence(self.q_tau.forward(), self.p_tau.forward())
         print("tau kl")
         print(tau_kl)
         return
+    
+    def compute_expected_log_likelihood(self):
+        """
+        Compute E_q[log p(y|θ,τ)] - the expected log likelihood of the data.
+        
+        For Gaussian likelihood p(y|μ,τ) with precision τ:
+        log p(y|μ,τ) = -0.5 * τ * ||y - μx||² + 0.5 * log(τ) - 0.5 * log(2π)
+        
+        Taking expectation over q(θ,τ):
+        E_q[log p(y|θ,τ)] = -0.5 * E[τ] * (MSE + sigma_forward) 
+                           + 0.5 * N * E_q[log τ] 
+                           - 0.5 * N * log(2π)
+        
+        Where:
+        - MSE = Σ_n (y_n - μ_x_n)² (sum over all data points)
+        - sigma_forward = forward(sigma) (variance contribution from σ)
+        - N = number of data points × output dimension size
+        - E[τ] = concentration/rate (mean of Gamma)
+        - E_q[log τ] = digamma(concentration) - log(rate) for Gamma distribution
+        
+        Returns:
+            Scalar value of expected log likelihood
+        """
+        # Compute MSE: E_q[(y - μx)²]
+        mse = self._calc_mu_mse()
+        
+        # Compute sigma forward: E_q[forward(σ)]
+        sigma_forward = self._calc_sigma_forward()
+        
+        # Get E[τ] (mean of q_tau)
+        tau_mean = self.q_tau.mean()
+        
+        # Get E_q[log τ] for Gamma distribution
+        # For Gamma(α, β): E[log X] = digamma(α) - log(β)
+        concentration = self.q_tau.concentration
+        rate = self.q_tau.rate
+        
+        # Extract data if they're quimb tensors and convert to torch tensors
+        if isinstance(concentration, qt.Tensor):
+            concentration = concentration.data
+        else:
+            concentration = torch.tensor(concentration, dtype=torch.float32)
+            
+        if isinstance(rate, qt.Tensor):
+            rate = rate.data
+        else:
+            rate = torch.tensor(rate, dtype=torch.float32)
+            
+        if isinstance(tau_mean, qt.Tensor):
+            tau_mean = tau_mean.data
+            
+        expected_log_tau = torch.digamma(concentration) - torch.log(rate)
+        
+        # Number of data points (samples × output dimension size)
+        # output_dimensions is a list of output labels
+        output_dim_size = 1
+        for out_label in self.output_dimensions:
+            output_dim_size *= self.mu.ind_size(out_label)
+        
+        N = self.data.samples * output_dim_size
+        
+        # Compute expected log likelihood
+        # E_q[log p(y|θ,τ)] = -0.5 * E[τ] * (MSE + sigma_forward) 
+        #                    + 0.5 * N * E_q[log τ] 
+        #                    - 0.5 * N * log(2π)
+        
+        likelihood_term1 = -0.5 * tau_mean * (mse + sigma_forward)
+        likelihood_term2 = 0.5 * N * expected_log_tau
+        likelihood_term3 = -0.5 * N * np.log(2 * np.pi)
+        
+        expected_log_likelihood = likelihood_term1 + likelihood_term2 + likelihood_term3
+        
+        print(f"\n=== Expected Log Likelihood ===")
+        print(f"MSE term: {mse}")
+        print(f"Sigma forward term: {sigma_forward}")
+        print(f"E[τ]: {tau_mean}")
+        print(f"E[log τ]: {expected_log_tau}")
+        print(f"N (samples × output_dim): {N}")
+        print(f"Term 1 (-0.5 * E[τ] * (MSE + sigma_forward)): {likelihood_term1}")
+        print(f"Term 2 (0.5 * N * E[log τ]): {likelihood_term2}")
+        print(f"Term 3 (-0.5 * N * log(2π)): {likelihood_term3}")
+        print(f"Total Expected Log Likelihood: {expected_log_likelihood}")
+        
+        return expected_log_likelihood
+    
+    def compute_elbo(self, verbose=True, print_components=False):
+        """
+        Compute the Evidence Lower BOund (ELBO).
+        
+        ELBO = E_q[log p(y|θ,τ)] - KL[q(θ)||p(θ)] - KL[q(τ)||p(τ)]
+        
+        The ELBO should INCREASE during training (become less negative).
+        It is a lower bound on log p(y), the log marginal likelihood.
+        
+        Where:
+        - E_q[log p(y|θ,τ)] is the expected log likelihood
+        - KL[q(θ)||p(θ)] is the sum of:
+            - KL divergence for all bonds (edges)
+            - KL divergence for all nodes (blocks)
+        - KL[q(τ)||p(τ)] is the KL divergence for the precision parameter
+        
+        Args:
+            verbose: If True, print summary of ELBO computation
+            print_components: If True, print detailed breakdown of likelihood
+        
+        Returns:
+            ELBO value (scalar)
+        """
+        # Compute expected log likelihood (with optional component printing)
+        if print_components:
+            expected_log_lik = self.compute_expected_log_likelihood()
+        else:
+            # Compute without printing
+            mse = self._calc_mu_mse()
+            sigma_forward = self._calc_sigma_forward()
+            tau_mean = self.q_tau.mean()
+            concentration = self.q_tau.concentration
+            rate = self.q_tau.rate
+            
+            if isinstance(concentration, qt.Tensor):
+                concentration = concentration.data
+            elif not isinstance(concentration, torch.Tensor):
+                concentration = torch.tensor(concentration, dtype=torch.get_default_dtype())
+            if isinstance(rate, qt.Tensor):
+                rate = rate.data
+            elif not isinstance(rate, torch.Tensor):
+                rate = torch.tensor(rate, dtype=torch.get_default_dtype())
+            if isinstance(tau_mean, qt.Tensor):
+                tau_mean = tau_mean.data
+                
+            expected_log_tau = torch.digamma(concentration) - torch.log(rate)
+            output_dim_size = 1
+            for out_label in self.output_dimensions:
+                output_dim_size *= self.mu.ind_size(out_label)
+            N = self.data.samples * output_dim_size
+            
+            expected_log_lik = (-0.5 * tau_mean * (mse + sigma_forward) + 
+                              0.5 * N * expected_log_tau - 
+                              0.5 * N * np.log(2 * np.pi))
+        
+        # Compute KL divergences (without printing)
+        bond_kl = self.compute_bond_kl(verbose=False)
+        node_kl = self.compute_node_kl(verbose=False)
+        tau_kl = kl_divergence(self.q_tau.forward(), self.p_tau.forward())
+        
+        # Extract scalar if it's a tensor
+        if isinstance(tau_kl, torch.Tensor):
+            tau_kl = tau_kl.item() if tau_kl.numel() == 1 else tau_kl.sum().item()
+        
+        # ELBO = Expected Log Likelihood - Total KL
+        total_kl = bond_kl + node_kl + tau_kl
+        elbo = expected_log_lik - total_kl
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"ELBO COMPUTATION")
+            print(f"{'='*60}")
+            print(f"Expected Log Likelihood: {expected_log_lik:.4f}")
+            print(f"Bond KL: {bond_kl:.4f}")
+            print(f"Node KL: {node_kl:.4f}")
+            print(f"Tau KL: {tau_kl:.4f}")
+            print(f"Total KL: {total_kl:.4f}")
+            print(f"ELBO = E[log p(y|θ,τ)] - KL: {elbo:.4f}")
+            print(f"{'='*60}\n")
+        
+        return elbo
 
     def _copy_data(self, data):
         """Helper to copy data arrays, backend-agnostic."""
@@ -854,21 +1137,54 @@ class BTN:
         }
         return tensor.reindex(reindex_map)
 
-    def fit(self, epochs):
+    def fit(self, epochs, track_elbo=False):
+        """
+        Train the model for a given number of epochs.
+        
+        Args:
+            epochs: Number of training iterations
+            track_elbo: If True, compute and print ELBO at each epoch (slower but informative)
+        """
         bonds = [i for i in self.mu.ind_map if i not in self.output_dimensions]
         nodes = list(self.mu.tag_map.keys())
+        
+        # Compute initial ELBO if tracking
+        if track_elbo:
+            elbo_before = self.compute_elbo(verbose=False, print_components=False)
+            print(f"Initial ELBO (before training): {elbo_before:.4f}")
+            print("-" * 60)
+        
         for i in range(epochs):
-            # self.debug_print()
+            # Store ELBO before updates
+            if track_elbo:
+                elbo_before_epoch = self.compute_elbo(verbose=False, print_components=False)
+            
+            # Perform all updates for this epoch
             for node_tag in nodes:
                 self.update_sigma_node(node_tag)
                 self.update_mu_node(node_tag)
             for bond_tag in bonds:
                 self.update_bond(bond_tag)
             self.update_tau()
+            
+            # Print progress
             ctau = self.q_tau.concentration
             rtau = self.q_tau.rate
             mse = self._calc_mu_mse()/self.data.samples
-            print(f"MSE {mse.data:.4f}, E[t] {self.get_tau_mean()}, C = {ctau}, R = {rtau:.4f}")
+            
+            if track_elbo:
+                elbo_after_epoch = self.compute_elbo(verbose=False, print_components=False)
+                delta_elbo = elbo_after_epoch - elbo_before_epoch
+                status = "✓" if delta_elbo >= 0 else "✗"
+                print(f"Epoch {i+1}/{epochs} | MSE {mse.data:.4f}, E[τ] {self.get_tau_mean():.2f}, "
+                      f"ELBO {elbo_after_epoch:.4f} (Δ={delta_elbo:+.4f}) {status}")
+            else:
+                print(f"MSE {mse.data:.4f}, E[t] {self.get_tau_mean()}, C = {ctau}, R = {rtau:.4f}")
+        
+        if track_elbo:
+            print("-" * 60)
+            print(f"Final ELBO: {elbo_after_epoch:.4f}")
+            print(f"Total change: {elbo_after_epoch - elbo_before:+.4f}")
         return
 
     def debug_print(self, node_tag=None, bond_tag=None):
