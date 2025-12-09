@@ -1,0 +1,48 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1764517877,
+        "narHash": "sha256-pp3uT4hHijIC8JUK5MEqeAWmParJrgBVzHLNfJDZxg4=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2d293cbfa5a793b4c50d17c05ef9e385b90edf6c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "quimb-flake": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1762866720,
+        "narHash": "sha256-tH6nSRlooOZ8azXSX3y3hi1GGAizsbY8wAAxsice3RQ=",
+        "owner": "niccogc",
+        "repo": "quimbflake",
+        "rev": "b598cde727d8670711e2cccaee2694aeb8571df3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "niccogc",
+        "repo": "quimbflake",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "quimb-flake": "quimb-flake"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
