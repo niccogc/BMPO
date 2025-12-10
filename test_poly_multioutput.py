@@ -22,10 +22,15 @@ def test_polynomial_learning():
     # We use a slightly wider range to test generalization within the interval
     x_raw = 2 * torch.rand(N_SAMPLES, 1) - 1
     
-    # Define Target Function: y = 2x^3 - x^2 + 0.5x + 0.2
-    # This requires a polynomial degree of 3.
-    # An MPS with 3 sites (each receiving inputs linear in x) can represent x^3.
-    y_raw = 2 * (x_raw**3) - (x_raw**2) + 0.5 * x_raw + 0.2
+    # Define Target Function with 3 OUTPUT DIMENSIONS
+    # y1 = 2x^3 - x^2 + 0.5x + 0.2
+    # y2 = x^2 + 0.3x
+    # y3 = -x^3 + 0.7x
+    y1 = 2 * (x_raw**3) - (x_raw**2) + 0.5 * x_raw + 0.2
+    y2 = (x_raw**2) + 0.3 * x_raw
+    y3 = -(x_raw**3) + 0.7 * x_raw
+    
+    y_raw = torch.cat([y1, y2, y3], dim=1)  # Shape: (N, 3)
     
     # Add small noise
     y_raw += 0.1 * torch.randn_like(y_raw)
@@ -64,7 +69,7 @@ def test_polynomial_learning():
     # 3 Nodes. Physical dimension = 2 (feature dim).
     # Bond dimension = 3 (sufficient for cubic poly).
 
-    D_bond = 6
+    D_bond = 4 
     D_phys = 2
     
     # Initialize with small random weights normalized to prevent explosion
@@ -87,9 +92,9 @@ def test_polynomial_learning():
     )
     
     # Node 3: Bond 'b2', Input 'x3', Output 'y'
-    # Output dimension is 1 (scalar regression)
+    # Output dimension is 3 (multi-output regression)
     t3 = qt.Tensor(
-        data=init_weights((D_bond, D_phys, D_bond, 1)), 
+        data=init_weights((D_bond, D_phys, D_bond, 3)), 
         inds=('b2', 'x3', 'b3', 'y'), 
         tags={'Node3'}
     )
@@ -127,7 +132,7 @@ def test_polynomial_learning():
     
     print("\n--- Computing Tau KL ---")
     tau_kl = model.compute_tau_kl()
-    print(tau_kl)
+    print(f"Total Tau KL: {tau_kl}")
     
     print("\n--- Computing Expected Log Likelihood ---")
     expected_log_lik = model.compute_expected_log_likelihood()
@@ -149,7 +154,7 @@ def test_polynomial_learning():
     print("="*60)
     print("Note: ELBO should INCREASE during training (become less negative)")
     print("="*60 + "\n")
-    model.fit(epochs=EPOCHS, track_elbo=False)
+    model.fit(epochs=EPOCHS, track_elbo=True)
     
     # ---------------------------------------------------------
     # 6. EVALUATION
@@ -180,8 +185,6 @@ def test_polynomial_learning():
         print("\n✅ SUCCESS: Model learned the polynomial structure.")
     else:
         print("\n⚠️ WARNING: Model might need more epochs or tuning.")
-
-    model.trim_bonds(True)
 
 if __name__ == "__main__":
     test_polynomial_learning()

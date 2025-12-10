@@ -24,6 +24,7 @@
     python = pkgs.python312;
     pythonWithNixPkgs = python.withPackages (ps:
       with ps; [
+        pandas
         torchvision
         torch
         jedi-language-server

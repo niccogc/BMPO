@@ -94,6 +94,29 @@ class GammaDistribution:
         res = c_data / r_data
         return _wrap_if_quimb(res, self.concentration, self.backend)
 
+    def trim(self, indices):
+        """
+        Keeps only the specified indices of the parameters.
+        Args:
+            indices: List or array of integers to keep.
+        """
+        def _slice_param(param, idxs):
+            # Case A: It is a quimb.Tensor
+            if hasattr(param, 'modify'): 
+                # Slice the underlying data directly
+                # We assume param is 1D (vector of weights), so slicing axis 0 is correct.
+                new_data = param.data[idxs]
+                param.modify(data=new_data)
+                return param
+            # Case B: It is a raw Torch/NumPy tensor
+            else:
+                return param[idxs]
+
+        self.concentration = _slice_param(self.concentration, indices)
+        self.rate = _slice_param(self.rate, indices)
+        
+        # Reset the cached distribution so it regenerates with new shape next time
+        self._distribution = None
 
 class MultivariateGaussianDistribution:
     """

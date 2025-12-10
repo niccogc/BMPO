@@ -33,6 +33,7 @@ class BTN:
 
             These nodes will be tagged with NOT_TRAINABLE_TAG ('NT').
         """
+        self.threshold = 0.8
         self.method = method
         self.mse = None
         self.sigma_forward = None
@@ -97,17 +98,18 @@ class BTN:
             verbose: If True, print individual node KL values
             debug: If True, print detailed debugging information
         
-        Key insight:
-        - mu structure: [variational_indices] + [output_indices]
-        - sigma structure: [variational_indices] + [variational_indices_prime] + [output_indices]
-        - For each output class, we have a separate posterior q(θ | output_class)
-        - Prior p(θ) is the SAME for all output classes (it's independent of output)
-        - Total KL = Σ_{output_class} KL[q(θ[variational] | class) || p(θ[variational])]
+        KEY CHANGE: Output dimensions are now treated as variational parameters!
+        - All indices (including output) have bond priors
+        - Prior: p(θ) = N(0, Σ_bonds) where Σ_bonds includes ALL dimensions
+        - Posterior: q(θ) has learned mean and covariance for ALL dimensions
+        - Just ONE KL per node: KL[q(θ) || p(θ)]
+        
+        FIXED: theta represents PRECISIONS (E[λ]), so covariance = 1/theta (element-wise)
         """
         total_kl = 0
         for i in self.p_nodes:
-            mu_idx = self.mu[i].inds
-            sigma_idx = self.sigma[i].inds
+            variational_mu, output_mu, mu_idx = self.get_variational_outputs_inds(self.mu[i])
+            variational_sigma, _, sigma_idx = self.get_variational_outputs_inds(self.sigma[i])
             mu_shape = self.mu[i].shape
             
             if debug:
@@ -118,110 +120,56 @@ class BTN:
                 print(f"mu_shape: {mu_shape}")
                 print(f"sigma_idx: {sigma_idx}")
             
-            # Separate output and variational indices
-            output_inds = [ind for ind in mu_idx if ind in self.output_dimensions]
-            variational_inds = [ind for ind in mu_idx if ind not in self.output_dimensions]
+            if debug:
+                print(f"variational_inds (includes output): {variational_mu}")
+            
+            # Get theta (PRECISION from bond priors) - use prior bonds
+            theta = self.theta_block_computation(i, use_prior=True)
+            
+            # FIXED: Convert precision to covariance BEFORE diagonalization
+            # Transpose to mu_idx ordering, then do element-wise 1/theta
+            theta = theta.transpose(*mu_idx)
+            theta_data = theta.data.flatten()
+            
+            # Covariance = 1/precision (element-wise)
+            cov_data = 1.0 / theta_data
+            
+            # Create diagonal covariance matrix
+            prior_cov = torch.diag(cov_data)
+            
+            prior_loc = torch.zeros_like(self.mu[i].data.flatten())
+            p = self.p_nodes[i].forward(loc=prior_loc, cov=prior_cov)
             
             if debug:
-                print(f"output_inds: {output_inds}")
-                print(f"variational_inds: {variational_inds}")
+                print(f"Prior p: mean shape = {prior_loc.shape}, cov shape = {prior_cov.shape}")
             
-            # Get shape for each index
-            shape_map = dict(zip(self.mu[i].inds, self.mu[i].shape))
+            # Q distribution: posterior q(theta)
+            # Flatten mu and sigma
+            mu_flat = self.mu[i].data.flatten()
             
-            # Build prior covariance diagonal FOR VARIATIONAL INDICES ONLY
-            cov_list = []
-            for ind in variational_inds:
-                bond_mean = self.p_bonds[ind].mean()
-                cov_list.append(bond_mean.data if isinstance(bond_mean, qt.Tensor) else bond_mean)
+            # Transpose sigma to have proper ordering: [var_inds] + [var_inds_prime]
+            primed_mu_idx = [inds + '_prime' for inds in mu_idx]
+            q_cov = self.sigma[i]
+            for out in output_mu:
+                primed = out + '_prime'
+                q_cov = q_cov.new_ind_pair_diag(out, out, primed)
+            q_cov = q_cov.to_dense(mu_idx, primed_mu_idx)
+            q = self.q_nodes[i].forward(loc=mu_flat, cov=q_cov)
             
-            # Compute outer product of all covariance components to get full diagonal
-            if cov_list:
-                full_cov = cov_list[0].flatten()
-                for cov_component in cov_list[1:]:
-                    full_cov = (full_cov.unsqueeze(-1) * cov_component.flatten().unsqueeze(0)).flatten()
-            else:
-                # No variational indices - this shouldn't happen in practice
-                d_total = int(np.prod(mu_shape))
-                full_cov = torch.ones(d_total, dtype=torch.float32)
-            
-            if debug:
-                print(f"Prior covariance diagonal shape: {full_cov.shape}")
-                print(f"Prior covariance diagonal (first 5): {full_cov[:5]}")
-            
-            # Create diagonal covariance matrix for prior p(theta)
-            # Prior has zero mean and diagonal covariance from bond priors (same for all output classes)
-            prior_cov_diag = torch.diag(full_cov)
-            prior_loc = torch.zeros(len(full_cov), dtype=torch.float32)
-            p = self.p_nodes[i].forward(loc=prior_loc, cov=prior_cov_diag)
-            
-            if debug:
-                print(f"Prior p: mean shape = {prior_loc.shape}, cov shape = {prior_cov_diag.shape}")
-            
-            # Q distribution: posterior q(theta | data, output_class)
-            # Calculate dimensions
-            d_var = int(np.prod([shape_map[ind] for ind in variational_inds])) if variational_inds else 1
-            d_out = int(np.prod([shape_map[ind] for ind in output_inds])) if output_inds else 1
-            
-            if debug:
-                print(f"d_var (variational dims product): {d_var}")
-                print(f"d_out (output dims product): {d_out}")
-            
-            # Reshape mu and sigma
-            # mu has shape [variational_inds, output_inds]
-            # Need to ensure proper ordering
-            mu_data = self.mu[i].data
-            sigma_data = self.sigma[i].data
-            
-            if debug:
-                print(f"mu_data original shape: {mu_data.shape}")
-                print(f"sigma_data original shape: {sigma_data.shape}")
-            
-            # Reshape: put variational first, output last
-            mu_reshaped = mu_data.reshape(d_var, d_out)  # [variational, output]
-            sigma_reshaped = sigma_data.reshape(d_var, d_var, d_out)  # [var, var, out]
-            
-            if debug:
-                print(f"mu_reshaped shape: {mu_reshaped.shape}")
-                print(f"sigma_reshaped shape: {sigma_reshaped.shape}")
-            
-            # Iterate over each output class and sum KL divergences
-            node_kl = 0
-            for out_idx in range(d_out):
-                # Extract mean and covariance for this output class
-                mu_class = mu_reshaped[:, out_idx]  # [d_var]
-                sigma_class = sigma_reshaped[:, :, out_idx]  # [d_var, d_var]
-                
-                if debug:
-                    print(f"\n  Output class {out_idx}:")
-                    print(f"  q: mu_class shape = {mu_class.shape}, sigma_class shape = {sigma_class.shape}")
-                    print(f"  q: mu_class (first 3) = {mu_class[:3]}")
-                
-                # Create posterior for this output class
-                q_class = self.q_nodes[i].forward(loc=mu_class, cov=sigma_class)
-                
-                # Compute KL for this class
-                kl_class = kl_divergence(q_class, p)
-                
-                if debug:
-                    print(f"  KL for class {out_idx}: {kl_class:.6f}")
-                
-                node_kl += kl_class
+            # Compute KL divergence (just ONE per node now!)
+            node_kl = kl_divergence(q, p)
             
             if debug or verbose:
-                print(f"\nNode {i}: Total KL = {node_kl:.4f} (summed over {d_out} output classes)")
+                print(f"\nNode {i}: KL = {node_kl:.4f} (single KL, output dims are variational)")
             
             total_kl += node_kl
             
         return total_kl
 
-    def compute_kl(self):
-        tau_kl = kl_divergence(self.q_tau.forward(), self.p_tau.forward())
-        print("tau kl")
-        print(tau_kl)
-        return
-    
-    def compute_expected_log_likelihood(self):
+    def compute_tau_kl(self):
+        return kl_divergence(self.q_tau.forward(), self.p_tau.forward())
+   
+    def compute_expected_log_likelihood(self, verbose = False):
         """
         Compute E_q[log p(y|θ,τ)] - the expected log likelihood of the data.
         
@@ -243,12 +191,14 @@ class BTN:
         Returns:
             Scalar value of expected log likelihood
         """
-        # Compute MSE: E_q[(y - μx)²]
-        mse = self._calc_mu_mse()
-        
-        # Compute sigma forward: E_q[forward(σ)]
-        sigma_forward = self._calc_sigma_forward()
-        
+        mse_sigma = self.q_tau.rate - self.p_tau.rate
+        if mse_sigma is None:
+            # Compute MSE: E_q[(y - μx)²]
+            mse = self._calc_mu_mse()
+            # Compute sigma forward: E_q[forward(σ)]
+            sigma_forward = self._calc_sigma_forward()
+            mse_sigma = (mse + sigma_forward)*0.5
+
         # Get E[τ] (mean of q_tau)
         tau_mean = self.q_tau.mean()
         
@@ -286,22 +236,22 @@ class BTN:
         #                    + 0.5 * N * E_q[log τ] 
         #                    - 0.5 * N * log(2π)
         
-        likelihood_term1 = -0.5 * tau_mean * (mse + sigma_forward)
+        likelihood_term1 = -tau_mean * mse_sigma
         likelihood_term2 = 0.5 * N * expected_log_tau
         likelihood_term3 = -0.5 * N * np.log(2 * np.pi)
         
         expected_log_likelihood = likelihood_term1 + likelihood_term2 + likelihood_term3
-        
-        print(f"\n=== Expected Log Likelihood ===")
-        print(f"MSE term: {mse}")
-        print(f"Sigma forward term: {sigma_forward}")
-        print(f"E[τ]: {tau_mean}")
-        print(f"E[log τ]: {expected_log_tau}")
-        print(f"N (samples × output_dim): {N}")
-        print(f"Term 1 (-0.5 * E[τ] * (MSE + sigma_forward)): {likelihood_term1}")
-        print(f"Term 2 (0.5 * N * E[log τ]): {likelihood_term2}")
-        print(f"Term 3 (-0.5 * N * log(2π)): {likelihood_term3}")
-        print(f"Total Expected Log Likelihood: {expected_log_likelihood}")
+        if verbose:    
+            print("\n=== Expected Log Likelihood ===")
+            print(f"MSE term: {mse}")
+            print(f"Sigma forward term: {sigma_forward}")
+            print(f"E[τ]: {tau_mean}")
+            print(f"E[log τ]: {expected_log_tau}")
+            print(f"N (samples × output_dim): {N}")
+            print(f"Term 1 (-0.5 * E[τ] * (MSE + sigma_forward)): {likelihood_term1}")
+            print(f"Term 2 (0.5 * N * E[log τ]): {likelihood_term2}")
+            print(f"Term 3 (-0.5 * N * log(2π)): {likelihood_term3}")
+            print(f"Total Expected Log Likelihood: {expected_log_likelihood}")
         
         return expected_log_likelihood
     
@@ -328,42 +278,12 @@ class BTN:
         Returns:
             ELBO value (scalar)
         """
-        # Compute expected log likelihood (with optional component printing)
-        if print_components:
-            expected_log_lik = self.compute_expected_log_likelihood()
-        else:
-            # Compute without printing
-            mse = self._calc_mu_mse()
-            sigma_forward = self._calc_sigma_forward()
-            tau_mean = self.q_tau.mean()
-            concentration = self.q_tau.concentration
-            rate = self.q_tau.rate
-            
-            if isinstance(concentration, qt.Tensor):
-                concentration = concentration.data
-            elif not isinstance(concentration, torch.Tensor):
-                concentration = torch.tensor(concentration, dtype=torch.get_default_dtype())
-            if isinstance(rate, qt.Tensor):
-                rate = rate.data
-            elif not isinstance(rate, torch.Tensor):
-                rate = torch.tensor(rate, dtype=torch.get_default_dtype())
-            if isinstance(tau_mean, qt.Tensor):
-                tau_mean = tau_mean.data
-                
-            expected_log_tau = torch.digamma(concentration) - torch.log(rate)
-            output_dim_size = 1
-            for out_label in self.output_dimensions:
-                output_dim_size *= self.mu.ind_size(out_label)
-            N = self.data.samples * output_dim_size
-            
-            expected_log_lik = (-0.5 * tau_mean * (mse + sigma_forward) + 
-                              0.5 * N * expected_log_tau - 
-                              0.5 * N * np.log(2 * np.pi))
-        
+
         # Compute KL divergences (without printing)
-        bond_kl = self.compute_bond_kl(verbose=False)
-        node_kl = self.compute_node_kl(verbose=False)
-        tau_kl = kl_divergence(self.q_tau.forward(), self.p_tau.forward())
+        expected_log_lik = self.compute_expected_log_likelihood(verbose=False)
+        bond_kl = self.compute_bond_kl(verbose=print_components)
+        node_kl = self.compute_node_kl(verbose=print_components)
+        tau_kl = self.compute_tau_kl()
         
         # Extract scalar if it's a tensor
         if isinstance(tau_kl, torch.Tensor):
@@ -730,7 +650,8 @@ class BTN:
 
     def theta_block_computation(self, 
                                 node_tag: str,
-                                exclude_bonds: Optional[List[str]] = None) -> qt.Tensor:
+                                exclude_bonds: Optional[List[str]] = None,
+                                use_prior: bool = False) -> qt.Tensor:
         """
         Compute theta^B(i) for a given node: the outer product of expected bond probabilities.
         
@@ -744,6 +665,9 @@ class BTN:
             node_tag: Tag identifying the node in the tensor network
             exclude_bonds: Optional list of bond indices (labels) to exclude from computation.
                           Output dimensions and batch_dim are always excluded.
+            use_prior: If True, use p_bonds (prior). If False, use q_bonds (posterior).
+                      Use True for computing prior covariance in KL.
+                      Use False for precision updates (default).
         
         Returns:
             quimb.Tensor with shape matching the node's shape minus excluded dimensions.
@@ -760,7 +684,7 @@ class BTN:
         
         # Get the node tensor from mu network
         node = self.mu[node_tag]
-        excluded_indices = self.output_dimensions + [self.batch_dim] + exclude_bonds 
+        excluded_indices = [self.batch_dim] + exclude_bonds 
         
         # Identify bond indices: all indices except output dims, batch dim, and excluded
         bond_indices = [
@@ -771,9 +695,12 @@ class BTN:
         if len(bond_indices) == 0:
             raise ValueError(f"Node {node_tag} has no bond indices after exclusions")
         
-        # Get expected values E[λ] = α/β for each bond from q_bonds (posterior)
+        # Choose which bond distributions to use
+        bond_dist = self.p_bonds if use_prior else self.q_bonds
+        
+        # Get expected values E[λ] = α/β for each bond
         # These are quimb.Tensor objects with their respective indices
-        bond_means = [self.q_bonds[bond_ind].mean() for bond_ind in bond_indices]
+        bond_means = [bond_dist[bond_ind].mean() for bond_ind in bond_indices]
         # Create TensorNetwork directly from list of tensors
         theta_tn = qt.TensorNetwork(bond_means)
         
@@ -830,6 +757,12 @@ class BTN:
             inputs = self.data
         sigma_forward = self.forward(self.sigma, inputs.data_sigma, True, True)
         return sigma_forward
+
+    def _calc_mu_forward(self, inputs = None):
+        if inputs is None:
+            inputs = self.data
+        mu_forward = self.forward(self.mu, inputs.data_mu, True, True)
+        return mu_forward
     
     def _get_tau_update(self):
         concentration = self.p_tau.concentration + self.data.samples * 0.5
@@ -878,12 +811,31 @@ class BTN:
     def get_tau_mean(self):
         return self.q_tau.mean()
 
+    def get_variational_outputs_inds(self,node):
+        node_inds = node.inds
+        node_output = []
+        node_variational = []
+        for i in node_inds:
+            if i in self.output_dimensions:
+                node_output.append(i)
+            else:
+                node_variational.append(i)
+
+        return node_variational, node_output, node_inds
+    
     def compute_precision_node(self,
                                    node_tag: str,
                                ) -> qt.Tensor:
 
         tau_expectation = self.get_tau_mean()
 
+        variational_inds, output_inds, node_inds = self.get_variational_outputs_inds(self.mu[node_tag])
+        # Calculate output dimension size (product of all output dims for this node)
+        output_dim_size = 1
+        for out_ind in output_inds:
+            output_dim_size *= self.mu.ind_size(out_ind)
+
+        # Compute environment terms (these sum over output, so we multiply by output_dim_size)
         sigma_env = self.get_environment(
                          tn =self.sigma,
                          target_tag=node_tag ,
@@ -899,37 +851,55 @@ class BTN:
             input_generator=self.data.data_mu,
             sum_over_batches=True
         )
-
+        
+        # Compute theta (bond prior contribution) - includes output dimensions
         theta = self.theta_block_computation(
             node_tag=node_tag,
         )
 
-        original_inds = theta.inds # Get a copy of indices to iterate over
-
-        for old_ind in original_inds:
+        for old_ind in variational_inds:
             primed_ind = old_ind + '_prime'
             # Expand the original index into the desired diagonal pair
             # The original values are placed along the diagonal of (old_ind, primed_ind)
             theta = theta.new_ind_pair_diag(old_ind, old_ind, primed_ind)
-        precision = tau_expectation * (sigma_env + mu_outer_env) + theta
-        # Broadcast over original output dimension
-        # To do after inverting.
-        # The inverse of a broadcast is the broadcast of the inverse o.o
-        # Just because we only care of the diagonal part of the broadcasted dimension, so It is the same as outer producting with an identity
+
+        # Outer product sigma_env and mu_outer_env with identity over output dims to match theta
+        # sigma_env and mu_outer_env have structure [variational] + [variational_prime] (no output)
+        # theta has structure [all_inds] + [all_inds_prime] (includes output with primes)
+        # We need to add output × output_prime dimensions to match
+        second_moments = tau_expectation * output_dim_size * (sigma_env + mu_outer_env)
+
+        for out_ind in output_inds:
+            out_size = self.mu.ind_size(out_ind)
+            second_moments.new_ind(out_ind, out_size, mode='repeat')
+        precision = second_moments + theta
+        
         return precision
 
     def _get_sigma_update(self, node_tag):
-        block_output_ind = [i for i in self.mu[node_tag].inds if i in self.output_dimensions]
-        block_variational_ind = [i for i in self.mu[node_tag].inds if i not in self.output_dimensions]
+        # All non-batch indices are now variational (including output!)
+        variational_ind, output_ind, node_ind = self.get_variational_outputs_inds(self.mu[node_tag])
         precision = self.compute_precision_node(node_tag)
-        tag = node_tag 
-        sigma_node = self.invert_ordered_tensor(precision, block_variational_ind, tag = tag)
-        for i in block_output_ind:
-            sigma_node.new_ind(i, self.mu.ind_size(i))
+        variational_ind_prime = [i + '_prime' for i in variational_ind]
+        map = {'o' : output_ind, 'rows' : variational_ind, 'cols': variational_ind_prime}
+        var_sizes = tuple(self.mu[node_tag].ind_size(i) for i in variational_ind)
+        out_sizes = tuple(self.mu[node_tag].ind_size(i) for i in output_ind)
+
+        # 3. Define the Shape Map (mapping fused index -> tuple of new sizes)
+        shape_map = {
+            'o': out_sizes,
+            'rows': var_sizes,
+            'cols': var_sizes  # 'cols' uses the same sizes as 'rows'
+        }
+        precision.fuse(map, inplace=True)
+        matrix_data = precision.to_dense(['o'], ['rows'], ['cols'])
+        tensor_sigma_node = self.invert_ordered_tensor(matrix_data)
+        sigma_node = qt.Tensor(tensor_sigma_node, ["o", 'rows', 'cols'], tags = node_tag)
+        sigma_node.unfuse(map, shape_map=shape_map,inplace=True)
         return sigma_node
 
     def _get_mu_update(self, node_tag, debug = False):
-        mu_idx = self.mu[node_tag].inds
+        variational_idx, output_idx, mu_idx = self.get_variational_outputs_inds(self.mu[node_tag])
         self.mu.delete(node_tag)
         rhs = self.forward_with_target(
             self.data.data_mu_y,
@@ -939,11 +909,9 @@ class BTN:
             output_inds = mu_idx
         )
         relabel_map = {}
-        for ind in mu_idx:
-            if ind in self.output_dimensions:
-                pass 
-            else:
-                relabel_map[ind] = ind + '_prime'
+        for ind in variational_idx:
+            relabel_map[ind] = ind + '_prime'
+        
         rhs = rhs.reindex(relabel_map)
         rhs = rhs * self.q_tau.mean()
         tn = rhs & self.sigma[node_tag]
@@ -985,63 +953,54 @@ class BTN:
             return 'numpy', np
 
     def cholesky_invert(self, matrix, backend_name, lib):
-        """Inverts Hermitian positive-definite matrix via Cholesky."""
+
         if backend_name == 'torch':
-            # Torch has a dedicated cholesky_inverse
-            L = lib.linalg.cholesky(matrix)
-            return lib.cholesky_inverse(L)
+            L = lib.linalg.cholesky(matrix)            # (B,n,n)
+            return lib.cholesky_inverse(L)             # (B,n,n)
+
         elif backend_name == 'jax':
-            # JAX requires solve against identity or custom implementation
-            L = lib.linalg.cholesky(matrix)
-            id_mat = lib.eye(matrix.shape[0], dtype=matrix.dtype)
-            return lib.linalg.solve(matrix, id_mat) # Often more stable than explicit inv
+            L = lib.linalg.cholesky(matrix)            # (B,n,n)
+            R = lib.eye(matrix.shape[-1], dtype=matrix.dtype)
+            R = lib.broadcast_to(R, matrix.shape)      # (B,n,n)
+            return lib.linalg.solve(matrix, R)         # (B,n,n)
+
         elif backend_name == 'numpy':
-            try:
-                L = lib.linalg.cholesky(matrix)
-                inv_L = lib.linalg.inv(L)
-                return inv_L.T.conj() @ inv_L
-            except lib.linalg.LinAlgError:
-                return lib.linalg.inv(matrix)
+            M = matrix
+            if M.ndim == 2:   # single matrix
+                try:
+                    L = lib.linalg.cholesky(M)
+                    invL = lib.linalg.inv(L)
+                    return invL.T.conj() @ invL
+                except lib.linalg.LinAlgError:
+                    return lib.linalg.inv(M)
+
+            out = []
+            for Mi in M:      # batch case
+                try:
+                    L = lib.linalg.cholesky(Mi)
+                    invL = lib.linalg.inv(L)
+                    out.append(invL.T.conj() @ invL)
+                except lib.linalg.LinAlgError:
+                    out.append(lib.linalg.inv(Mi))
+            return lib.array(out)
         else:
-            raise ValueError(f"Unknown backend '{backend_name}' for inversion.")
+            raise ValueError(f"Unknown backend '{backend_name}'.")
 
-    def invert_ordered_tensor(self, tensor, index_bases, method='cholesky', tag=None):
+
+    def invert_ordered_tensor(self, matrix_data, method='cholesky'):
         """
-        Inverts a tensor treating 'index_bases' as the column indices 
-        and 'index_bases + _prime' as the row indices.
+            Matrix data can should be batched
         """
-        if tag is None:
-            tag = tensor.tags
-            
-        # 1. Sort indices for consistent ordering (Block Layout)
-        # col_inds = Unprimes (e.g., 'b1', 'x2')
-        # row_inds = Primes   (e.g., 'b1_prime', 'x2_prime')
-        col_inds = sorted(index_bases)
-        row_inds = [i + '_prime' for i in col_inds]
 
-        # 2. Extract Matrix: (Rows=Unprimes, Cols=Primes)
-        # We explicitly map Unprimes to Rows to match standard linear algebra 
-        # A * x = b  (A has rows matching x's indices)
-        matrix_data = tensor.to_dense(col_inds, row_inds)
-
-        # 3. Detect Backend & Invert
         backend_name, lib = self.get_backend(matrix_data)
-        
+
         if method == 'cholesky':
             inv_data = self.cholesky_invert(matrix_data, backend_name, lib)
         else:
-            if backend_name in ('torch', 'jax', 'numpy'):
-                inv_data = lib.linalg.inv(matrix_data)
-            else:
-                raise ValueError(f"Unknown backend '{backend_name}' for inversion.")
+            inv_data = lib.linalg.inv(matrix_data)
 
-        # 4. Reshape & Return
-        # The matrix 'inv_data' is (Unprimes, Primes). 
-        # We must assign indices in that exact order.
-        new_shape = tuple(tensor.ind_size(i) for i in col_inds + row_inds)
-        inv_tensor_data = inv_data.reshape(new_shape)
+        return inv_data
 
-        return qt.Tensor(data=inv_tensor_data, inds=col_inds + row_inds, tags=tag)
 
     def outer_operation(self, input_generator, tn, node_tag, sum_over_batches):
         if sum_over_batches:
@@ -1127,7 +1086,100 @@ class BTN:
         }
         
         return tensor.reindex(reindex_map)
+
+   
+    def _trim_bond(self, bond_tag, verbose = False):
+        weights = self.q_bonds[bond_tag].mean().data
+        threshold = self.threshold
+        # --- 3. SORT & TRACK INDICES ---
+        # argsort(descending=True) returns the INDICES of the values from High -> Low
+        # This effectively "keeps track of the position of the original"
+        sorted_indices = torch.argsort(weights, descending=True)
+        sorted_weights = weights[sorted_indices]
+
+        # --- 4. CUMULATIVE SUM & THRESHOLD ---
+        # Calculate normalized cumulative sum
+        cumsum = torch.cumsum(sorted_weights, dim=0)
+        total_relevance = cumsum[-1]
+        normalized_cumsum = cumsum / total_relevance
+
+        # Find the first index where we cross the threshold
+        # (searchsorted finds the insertion point, which corresponds to our cut)
+        cutoff_idx = torch.searchsorted(normalized_cumsum, threshold).item()
+
+        # We need to include the index that crossed the threshold, so we slice up to cutoff_idx + 1
+        indices_to_keep = sorted_indices[:cutoff_idx + 1]
+
+        # Convert to standard python list for Quimb
+        indices_list = indices_to_keep.tolist()
+
+
+        _, nodes = self.count_trainable_nodes_on_bond(bond_tag)
+
+        for node in nodes:
+            # Slice 'mu' (Single index)
+            self.fancy_isel(self.mu[node], {f'{bond_tag}': indices_list})
+            
+            # Slice 'sigma' (Two indices: bond_tag AND bond_tag_prime)
+            self.fancy_isel(self.sigma[node], {
+                f'{bond_tag}': indices_list, 
+                f'{bond_tag}_prime': indices_list
+            })
+
+        if bond_tag in self.p_bonds:
+            self.p_bonds[bond_tag].trim(indices_list)
+
+        if bond_tag in self.q_bonds:
+            self.q_bonds[bond_tag].trim(indices_list)
+
+        if verbose:
+            print(f"Original Weights: {weights}")
+            print(f"Sorted Indices:   {sorted_indices}")
+            print(f"Keeping Indices:  {indices_list}")
+            print(f"Number of remaining indices {len(indices_list)}, Number of cut Indices {len(weights) - len(indices_list)}")
+        return
   
+    def fancy_isel(self, tensor, index_dict):
+        # We work on a copy of the data first to avoid mutating mid-process
+        # (Though we will modify the tensor in-place at the end)
+        new_data = tensor.data
+    
+        # We iterate over the requested slices
+        # e.g., {'b1': [0, 2], 'b1_prime': [0, 2]}
+        for index_name, keep_indices in index_dict.items():
+        
+            # 1. Find which axis this name corresponds to
+            try:
+                axis_idx = tensor.inds.index(index_name)
+            except ValueError:
+                raise ValueError(f"Index '{index_name}' not found in tensor indices: {tensor.inds}")
+
+            # 2. Build the slicer
+            # We start with [slice(None), slice(None), ...] (select everything)
+            slicer = [slice(None)] * new_data.ndim
+        
+            # Replace the target axis with the list of indices to keep
+            slicer[axis_idx] = keep_indices
+        
+            # 3. Apply the slice
+            # Note: By doing this sequentially inside the loop, we avoid the 
+            # "Advanced Indexing" trap where x[[0,1], [0,1]] returns the diagonal.
+            # This ensures we get the full sub-block (orthogonal slicing).
+            new_data = new_data[tuple(slicer)]
+
+        # 4. Update the tensor in-place
+        # modify() tells quimb "Here is the new data, please trust me that 
+        # the indices (tags) haven't changed, only the shape size."
+        tensor.modify(data=new_data)
+    
+        return tensor
+    def trim_bonds(self, verbose = False):
+        for bond in self.q_bonds:
+            if bond in self.output_dimensions or bond in self.input_indices:
+                continue
+            self._trim_bond(bond, verbose = verbose)
+        return
+        
     def _unprime_indices_tensor(self, tensor: qt.Tensor, prime_suffix: str = "_prime") -> qt.Tensor:
 
         reindex_map = {
@@ -1137,7 +1189,7 @@ class BTN:
         }
         return tensor.reindex(reindex_map)
 
-    def fit(self, epochs, track_elbo=False):
+    def fit(self, epochs, track_elbo=False, trim_every_epochs = None):
         """
         Train the model for a given number of epochs.
         
@@ -1145,8 +1197,16 @@ class BTN:
             epochs: Number of training iterations
             track_elbo: If True, compute and print ELBO at each epoch (slower but informative)
         """
-        bonds = [i for i in self.mu.ind_map if i not in self.output_dimensions]
+        bonds = [i for i in self.mu.ind_map if i != self.batch_dim]
         nodes = list(self.mu.tag_map.keys())
+        if not isinstance(trim_every_epochs, int) or not isinstance(trim_every_epochs, bool):
+            raise ValueError(f"trim_every_epochs must be a Bool, or an int to tell the frequency, instead got {trim_every_epochs}")
+
+        if not isinstance(trim_every_epochs, int):
+            if trim_every_epochs:
+                trim_every_epochs = 1
+            else:
+                trim_every_epochs = epochs + 1
         
         # Compute initial ELBO if tracking
         if track_elbo:
@@ -1171,7 +1231,8 @@ class BTN:
             ctau = self.q_tau.concentration
             rtau = self.q_tau.rate
             mse = self._calc_mu_mse()/self.data.samples
-            
+            if epochs % trim_every_epochs == 0:
+                self.trim_bonds()
             if track_elbo:
                 elbo_after_epoch = self.compute_elbo(verbose=False, print_components=False)
                 delta_elbo = elbo_after_epoch - elbo_before_epoch

@@ -213,31 +213,38 @@ class BTNBuilder:
         """
         Constructs Gamma distributions with quimb.Tensor parameters.
         Tags: {ind}_alpha and {ind}_beta.
+        
+        NOW ALSO INCLUDES OUTPUT DIMENSIONS - treat them as variational parameters!
+        
+        FIXED: Prior (p_bonds) now uses FIXED hyperparameters (alpha=1, beta=1) for uninformative prior.
         """
 
         for ind, tids in all_inds_map.items():
-            if ind in self.output_dimensions or ind == self.batch_dim:
+            # Skip only batch dimension, NOT output dimensions anymore
+            if ind == self.batch_dim:
                 continue
             
             exemplar_tensor = self.mu.tensor_map[next(iter(tids))]
             dim_size = exemplar_tensor.shape[exemplar_tensor.inds.index(ind)]
             
             # --- Build Prior (p) ---
-            # Tag convention: bondname_alpha, bondname_beta
-            alpha = qt.Tensor(data=torch.rand(dim_size, dtype = torch.float64), inds=(ind,), tags={f"{ind}_alpha", "prior"})
-            beta = qt.Tensor(data=torch.rand(dim_size, dtype = torch.float64), inds=(ind,), tags={f"{ind}_beta", "prior"})
-            p_alpha = alpha.copy()
-            p_beta = beta.copy()
+            # FIXED: Use fixed hyperparameters alpha=1, beta=1 (uninformative prior)
+            # This ensures the prior is constant and not random
+            p_alpha = qt.Tensor(data=torch.ones(dim_size, dtype=torch.float64), 
+                               inds=(ind,), tags={f"{ind}_alpha", "prior"})
+            p_beta = qt.Tensor(data=torch.ones(dim_size, dtype=torch.float64), 
+                              inds=(ind,), tags={f"{ind}_beta", "prior"})
             
-            self.p_bonds[ind] = GammaDistribution(concentration=p_alpha, rate=p_beta, backend = self.backend)
+            self.p_bonds[ind] = GammaDistribution(concentration=p_alpha, rate=p_beta, backend=self.backend)
             
             # --- Build Posterior (q) ---
-            alpha = qt.Tensor(data=torch.ones(dim_size, dtype = torch.float64)*2, inds=(ind,), tags={f"{ind}_alpha", "prior"})
-            beta = qt.Tensor(data=torch.ones(dim_size, dtype = torch.float64), inds=(ind,), tags={f"{ind}_beta", "prior"})
-            q_alpha =alpha.copy()
-            q_beta = beta.copy()
+            # Initialize with alpha=2, beta=1 (will be updated during training)
+            q_alpha = qt.Tensor(data=torch.ones(dim_size, dtype=torch.float64)*2, 
+                               inds=(ind,), tags={f"{ind}_alpha", "posterior"})
+            q_beta = qt.Tensor(data=torch.ones(dim_size, dtype=torch.float64), 
+                              inds=(ind,), tags={f"{ind}_beta", "posterior"})
             
-            self.q_bonds[ind] = GammaDistribution(concentration=q_alpha, rate=q_beta, backend =self.backend)
+            self.q_bonds[ind] = GammaDistribution(concentration=q_alpha, rate=q_beta, backend=self.backend)
 
     def _construct_sigma_topology(self) -> qt.TensorNetwork:
         """
