@@ -97,9 +97,10 @@ def run_bayesian_regression_test():
     # ---------------------------------------------------------
     print(f"\nStarting Training on {N_SAMPLES} samples...")
     # Track ELBO to ensure convergence
-    model.fit(epochs=10, track_elbo=True) 
+    model.fit(epochs=10, track_elbo=True, trim_every_epochs=True, threshold=0.9) 
     print("Training Complete.")
-
+    for i in model.mu.tags:
+        print(model.mu[i].shape)
     # ---------------------------------------------------------
     # 4. INFERENCE (FIXED)
     # ---------------------------------------------------------

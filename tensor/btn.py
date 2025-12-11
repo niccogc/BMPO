@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from tensor.builder import BTNBuilder, Inputs
 from tensor.distributions import GammaDistribution
-torch.set_default_dtype(torch.float32)   # or torch.float64
+torch.set_default_dtype(torch.float64)   # or torch.float64
 
 # Tag for nodes that should not be trained
 NOT_TRAINABLE_TAG = "NT"
@@ -431,7 +431,7 @@ class BTN:
             Environment tensor with indices determined by flags.
             The "hole" indices (where the removed tensor connects) are always kept.
         """
-        env_tn= tn & inputs
+        env_tn = tn & inputs
         # 1. Create the "hole"
         env_tn.delete(target_tag)
 
@@ -1173,6 +1173,7 @@ class BTN:
         tensor.modify(data=new_data)
     
         return tensor
+
     def trim_bonds(self, verbose = False):
         for bond in self.q_bonds:
             if bond in self.output_dimensions or bond in self.input_indices:
@@ -1189,24 +1190,58 @@ class BTN:
         }
         return tensor.reindex(reindex_map)
 
-    def fit(self, epochs, track_elbo=False, trim_every_epochs = None):
+    def fit(self, epochs, track_elbo=False, track_kl_components=False, trim_every_epochs = False, threshold = 1.1):
         """
         Train the model for a given number of epochs.
         
         Args:
             epochs: Number of training iterations
-            track_elbo: If True, compute and print ELBO at each epoch (slower but informative)
+            track_elbo: If True, compute and track ELBO at each epoch (slower but informative)
+            track_kl_components: If True, also track detailed KL components (bond, node, tau)
+            trim_every_epochs: Frequency of bond trimming (False = no trimming, or int for frequency)
+            threshold: Threshold for bond trimming
+            
+        Returns:
+            dict: Training history containing:
+                - 'mse': List of MSE values per epoch
+                - 'tau_mean': List of E[τ] values per epoch
+                - 'tau_concentration': List of concentration parameters
+                - 'tau_rate': List of rate parameters
+                - 'elbo': List of ELBO values per epoch (if track_elbo=True)
+                - 'elbo_delta': List of ELBO changes per epoch (if track_elbo=True)
+                - 'bond_kl': List of bond KL per epoch (if track_kl_components=True)
+                - 'node_kl': List of node KL per epoch (if track_kl_components=True)
+                - 'tau_kl': List of tau KL per epoch (if track_kl_components=True)
+                - 'exp_log_lik': List of expected log likelihood per epoch (if track_kl_components=True)
         """
+        self.threshold = threshold
         bonds = [i for i in self.mu.ind_map if i != self.batch_dim]
         nodes = list(self.mu.tag_map.keys())
-        if not isinstance(trim_every_epochs, int) or not isinstance(trim_every_epochs, bool):
+        if not isinstance(trim_every_epochs, int):
             raise ValueError(f"trim_every_epochs must be a Bool, or an int to tell the frequency, instead got {trim_every_epochs}")
 
-        if not isinstance(trim_every_epochs, int):
-            if trim_every_epochs:
-                trim_every_epochs = 1
-            else:
+        if isinstance(trim_every_epochs, bool):
+            if not trim_every_epochs:
                 trim_every_epochs = epochs + 1
+        
+        # Initialize tracking dictionary
+        history = {
+            'epoch': [],
+            'mse': [],
+            'tau_mean': [],
+            'tau_concentration': [],
+            'tau_rate': []
+        }
+        
+        if track_elbo:
+            history['elbo'] = []
+            history['elbo_delta'] = []
+        
+        if track_kl_components:
+            history['bond_kl'] = []
+            history['node_kl'] = []
+            history['tau_kl'] = []
+            history['exp_log_lik'] = []
         
         # Compute initial ELBO if tracking
         if track_elbo:
@@ -1214,6 +1249,45 @@ class BTN:
             print(f"Initial ELBO (before training): {elbo_before:.4f}")
             print("-" * 60)
         
+        ctau = self.q_tau.concentration
+        rtau = self.q_tau.rate
+        mse = self._calc_mu_mse()/self.data.samples
+        tau_mean = self.get_tau_mean()
+        
+        history['epoch'].append(0)
+        history['mse'].append(float(mse.data))
+        history['tau_mean'].append(float(tau_mean))
+        history['tau_concentration'].append(float(ctau))
+        history['tau_rate'].append(float(rtau))
+        
+        # Track KL components if requested
+        if track_kl_components:
+            bond_kl = self.compute_bond_kl(verbose=False)
+            node_kl = self.compute_node_kl(verbose=False)
+            tau_kl = self.compute_tau_kl()
+            exp_log_lik = self.compute_expected_log_likelihood(verbose=False)
+            
+            # Ensure tau_kl is scalar
+            if isinstance(tau_kl, torch.Tensor):
+                tau_kl = tau_kl.item() if tau_kl.numel() == 1 else tau_kl.sum().item()
+            
+            history['bond_kl'].append(float(bond_kl))
+            history['node_kl'].append(float(node_kl))
+            history['tau_kl'].append(float(tau_kl))
+            history['exp_log_lik'].append(float(exp_log_lik))
+        
+        # Track ELBO and print progress
+        if track_elbo:
+            elbo_after_epoch = self.compute_elbo(verbose=False, print_components=False)
+            delta_elbo = 0
+            history['elbo'].append(float(elbo_after_epoch))
+            history['elbo_delta'].append(float(delta_elbo))
+            
+            status = "✓" if delta_elbo >= 0 else "✗"
+            print(f"Epoch {0}/{epochs} | MSE {mse.data:.4f}, E[τ] {tau_mean:.2f}, "
+                  f"ELBO {elbo_after_epoch:.4f} (Δ={delta_elbo:+.4f}) {status}")
+        else:
+            print(f"Epoch {0}/{epochs} | MSE {mse.data:.4f}, E[τ] {tau_mean:.2f}")
         for i in range(epochs):
             # Store ELBO before updates
             if track_elbo:
@@ -1227,26 +1301,57 @@ class BTN:
                 self.update_bond(bond_tag)
             self.update_tau()
             
-            # Print progress
+            # Compute and store metrics
             ctau = self.q_tau.concentration
             rtau = self.q_tau.rate
             mse = self._calc_mu_mse()/self.data.samples
-            if epochs % trim_every_epochs == 0:
+            tau_mean = self.get_tau_mean()
+            
+            history['epoch'].append(i + 1)
+            history['mse'].append(float(mse.data))
+            history['tau_mean'].append(float(tau_mean))
+            history['tau_concentration'].append(float(ctau))
+            history['tau_rate'].append(float(rtau))
+            
+            # Track KL components if requested
+            if track_kl_components:
+                bond_kl = self.compute_bond_kl(verbose=False)
+                node_kl = self.compute_node_kl(verbose=False)
+                tau_kl = self.compute_tau_kl()
+                exp_log_lik = self.compute_expected_log_likelihood(verbose=False)
+                
+                # Ensure tau_kl is scalar
+                if isinstance(tau_kl, torch.Tensor):
+                    tau_kl = tau_kl.item() if tau_kl.numel() == 1 else tau_kl.sum().item()
+                
+                history['bond_kl'].append(float(bond_kl))
+                history['node_kl'].append(float(node_kl))
+                history['tau_kl'].append(float(tau_kl))
+                history['exp_log_lik'].append(float(exp_log_lik))
+            
+            # Trim bonds if needed
+            if (i + 1) % trim_every_epochs == 0:
                 self.trim_bonds()
+            
+            # Track ELBO and print progress
             if track_elbo:
                 elbo_after_epoch = self.compute_elbo(verbose=False, print_components=False)
                 delta_elbo = elbo_after_epoch - elbo_before_epoch
+                history['elbo'].append(float(elbo_after_epoch))
+                history['elbo_delta'].append(float(delta_elbo))
+                
                 status = "✓" if delta_elbo >= 0 else "✗"
-                print(f"Epoch {i+1}/{epochs} | MSE {mse.data:.4f}, E[τ] {self.get_tau_mean():.2f}, "
+                print(f"Epoch {i+1}/{epochs} | MSE {mse.data:.4f}, E[τ] {tau_mean:.2f}, "
                       f"ELBO {elbo_after_epoch:.4f} (Δ={delta_elbo:+.4f}) {status}")
             else:
-                print(f"MSE {mse.data:.4f}, E[t] {self.get_tau_mean()}, C = {ctau}, R = {rtau:.4f}")
+                print(f"Epoch {i+1}/{epochs} | MSE {mse.data:.4f}, E[τ] {tau_mean:.2f}")
         
         if track_elbo:
             print("-" * 60)
-            print(f"Final ELBO: {elbo_after_epoch:.4f}")
-            print(f"Total change: {elbo_after_epoch - elbo_before:+.4f}")
-        return
+            print(f"Final ELBO: {history['elbo'][-1]:.4f}")
+            print(f"Total change: {history['elbo'][-1] - history['elbo'][0]:+.4f}")
+        
+        return history
 
     def debug_print(self, node_tag=None, bond_tag=None):
         bonds = [i for i in self.mu.ind_map if i not in self.output_dimensions] if bond_tag is None else [bond_tag]
