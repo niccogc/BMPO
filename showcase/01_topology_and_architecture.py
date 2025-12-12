@@ -47,7 +47,6 @@ mu_standard = qt.TensorNetwork([t1, t2, t3])
 
 total_params = sum(t.data.numel() if hasattr(t.data, 'numel') else t.data.size for t in mu_standard)
 print(f"  Nodes: {len(mu_standard.tensors)}, Params: {total_params}")
-
 # Print network structure
 print("\n  Network Structure:")
 for i, tensor in enumerate(mu_standard.tensors, 1):

@@ -252,34 +252,34 @@ snapshot_count += 1
 print(f"  Snapshot {snapshot_count:3d}: Initial")
 
 # Training loop with block-by-block snapshots
-# for epoch in range(EPOCHS):
-#     print(f"\n  Epoch {epoch+1}/{EPOCHS}:")
+for epoch in range(EPOCHS):
+    print(f"\n  Epoch {epoch+1}/{EPOCHS}:")
     
-#     # Update each node (Sigma then Mu)
-#     for node_idx, node_tag in enumerate(nodes):
-#         # Update Sigma
-#         model.update_sigma_node(node_tag)
-#         create_snapshot(snapshot_count, epoch+1, node_idx, f"After Σ update: {node_tag}")
-#         snapshot_count += 1
-#         print(f"    Snapshot {snapshot_count:3d}: Σ[{node_tag}] updated")
+    # Update each node (Sigma then Mu)
+    for node_idx, node_tag in enumerate(nodes):
+        # Update Sigma
+        model.update_sigma_node(node_tag)
+        create_snapshot(snapshot_count, epoch+1, node_idx, f"After Σ update: {node_tag}")
+        snapshot_count += 1
+        print(f"    Snapshot {snapshot_count:3d}: Σ[{node_tag}] updated")
         
-#         # Update Mu
-#         model.update_mu_node(node_tag)
-#         create_snapshot(snapshot_count, epoch+1, node_idx, f"After μ update: {node_tag}")
-#         snapshot_count += 1
-#         print(f"    Snapshot {snapshot_count:3d}: μ[{node_tag}] updated")
+        # Update Mu
+        model.update_mu_node(node_tag)
+        create_snapshot(snapshot_count, epoch+1, node_idx, f"After μ update: {node_tag}")
+        snapshot_count += 1
+        print(f"    Snapshot {snapshot_count:3d}: μ[{node_tag}] updated")
     
-#     # Update bonds
-#     for bond_tag in bonds:
-#         model.update_bond(bond_tag)
+    # Update bonds
+    for bond_tag in bonds:
+        model.update_bond(bond_tag)
     
-#     # Update tau
-#     model.update_tau()
+    # Update tau
+    model.update_tau()
     
-    # Snapshot after full epoch
-    # create_snapshot(snapshot_count, epoch+1, len(nodes), f"Epoch {epoch+1} complete (after τ update)")
-    # snapshot_count += 1
-    # print(f"    Snapshot {snapshot_count:3d}: Epoch {epoch+1} complete")
+  # Snapshot after full epoch
+  # create_snapshot(snapshot_count, epoch+1, len(nodes), f"Epoch {epoch+1} complete (after τ update)")
+  # snapshot_count += 1
+  # print(f"    Snapshot {snapshot_count:3d}: Epoch {epoch+1} complete")
 
 print(f"\n  Created {snapshot_count} snapshots in {snapshot_dir}/")
 print(f"  To create GIF: convert -delay 30 -loop 0 {snapshot_dir}/frame_*.png outputs/03_training_evolution.gif")

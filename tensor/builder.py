@@ -53,7 +53,6 @@ class Inputs:
                 mu, prime = self.prepare_inputs_batch(input_dict)
            
             batches.append((mu, prime, y_tensor))
-            
         return batches
 
     # --- Properties for Iteration ---
@@ -259,60 +258,37 @@ class BTNBuilder:
             original_inds = tensor.inds
             original_tags = tensor.tags
             
-            non_output_inds = []
-            output_inds = []
-            
-            for ix in original_inds:
-                if ix in self.output_dimensions:
-                    output_inds.append(ix)
-                else:
-                    non_output_inds.append(ix)
-            
-            non_output_primes = [f"{ix}_prime" for ix in non_output_inds]
-            sigma_inds = tuple(non_output_inds + non_output_primes + output_inds)
+            primes = tuple([f"{ix}_prime" for ix in original_inds])
+            print(original_inds)
+            sigma_inds = tuple(original_inds + primes)
             
             shape_map = dict(zip(tensor.inds, tensor.shape))
             
             # 1. Calculate dimensions for non-output and output parts
-            non_out_dims = [shape_map[ix] for ix in non_output_inds]
-            out_dims = [shape_map[ix] for ix in output_inds]
+            dims = [shape_map[ix] for ix in original_inds]
+            # out_dims = [shape_map[ix] for ix in output_inds]
             
             # 2. Total flattened size of non-output dimensions
             #    (e.g., if indices are 'a', 'b' with sizes 2, 3 -> d_non_out = 6)
-            d_non_out = int(np.prod(non_out_dims))
+            d = int(np.prod(dims))
             
             # 3. Create Identity Matrix for the non-output part
             #    This ensures sigma[a, b, ..., a', b', ...] is non-zero ONLY if a==a' AND b==b' ...
-            eye_matrix = torch.eye(d_non_out)
+            eye_matrix = torch.eye(d)
             
             # 4. Reshape Identity back to tensor structure
             #    (d_non_out, d_non_out) -> (dim_a, dim_b, ..., dim_a_prime, dim_b_prime, ...)
             #    Note: This assumes the order in sigma_inds matches [non_outputs, non_outputs_prime, outputs]
-            eye_tensor = eye_matrix.reshape(non_out_dims + non_out_dims)
+            eye_tensor = eye_matrix.reshape(dims+ dims)
             
             # 5. Handle Output Dimensions (Broadcasting)
             #    The covariance structure is usually repeated/shared across output dimensions for isotropic initialization
-            if out_dims:
-                # Expand dims for outputs
-                for _ in out_dims:
-                    eye_tensor = eye_tensor.unsqueeze(-1)
-                
-                # Expand values (broadcast)
-                final_shape = non_out_dims + non_out_dims + out_dims
-                sigma_data = eye_tensor.expand(final_shape).clone()
-            else:
-                sigma_data = eye_tensor.clone()
-            
-            # 6. Scaling
-            #    Scale to be small enough
-            # Just for testing
-            shape_len = len(sigma_data.shape)
-            if len(sigma_data.shape) == 4:
+            shape_len = len(eye_tensor.shape)
+            if len(eye_tensor.shape) == 4:
                 shape_len = 6
-            avg_rank = torch.tensor(sigma_data.shape, dtype=torch.float64).prod().pow(1.0 / shape_len).item()
-            new_shape_total_size = np.prod(sigma_data.shape)
+            avg_rank = torch.tensor(eye_tensor.shape, dtype=torch.float64).prod().pow(1.0 / shape_len).item()
             scale = 1.0 / (avg_rank * self.mu.num_tensors)
-            sigma_data = sigma_data * scale
+            sigma_data = eye_tensor* scale
             
             sigma_tags = {f"{tag}" for tag in original_tags}
             

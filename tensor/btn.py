@@ -7,7 +7,7 @@ import quimb.tensor as qt
 import numpy as np
 import torch
 from tensor.builder import BTNBuilder, Inputs
-from tensor.distributions import GammaDistribution
+from tensor.distributions import GammaDistribution, WishartDistribution
 torch.set_default_dtype(torch.float64)   # or torch.float64
 
 # Tag for nodes that should not be trained
@@ -38,7 +38,9 @@ class BTN:
         self.mse = None
         self.sigma_forward = None
         self.mu = mu
-        self.output_dimensions = data_stream.outputs_labels
+        prime = [i + '_prime' for i in data_stream.outputs_labels]
+        self.output_dimensions_unprimed = data_stream.outputs_labels
+        self.output_dimensions = data_stream.outputs_labels + prime
         self.batch_dim = batch_dim
         self.input_indices = data_stream.input_labels
         self.data = data_stream
@@ -54,6 +56,21 @@ class BTN:
       
         # --- Initialize Builder and Model Components ---
         builder = BTNBuilder(self.mu, self.output_dimensions, self.batch_dim)
+
+        for i in self.data.data_y:
+            y_example = i.copy()
+            break
+
+        inds  = y_example.inds
+
+        no_batch = [i for i in inds if i not in [self.batch_dim]]
+        sizes = y_example.inds_size(no_batch)
+
+        data = torch.ones(sizes)
+        cov = qt.Tensor(data=data, inds=no_batch)
+        for i in no_batch:
+            primed = i + '_prime'
+            cov = cov.new_ind_pair_diag(i, i, primed)
         
         # Build and unpack components
         # p_bonds: Priors for edges (Gamma)
@@ -61,13 +78,14 @@ class BTN:
         # q_bonds: Posteriors for edges (Gamma)
         # q_nodes: Posteriors for nodes (Gaussian)
         # sigma: The covariance TensorNetwork
+        # 
         self.backend = self.mu.backend
-        self.p_tau = GammaDistribution(concentration = 1, rate = 1, backend=self.backend)
-        self.q_tau = GammaDistribution(concentration = 1, rate = 1, backend=self.backend)
-        (self.p_bonds, 
-         self.p_nodes, 
-         self.q_bonds, 
-         self.q_nodes, 
+        self.p_tau = WishartDistribution(df = 1, precision = cov.copy(), covariance = cov, inds = self.output_dimensions, backend=self.backend)
+        self.q_tau = WishartDistribution(df = 1, covariance = cov, inds = self.output_dimensions, backend=self.backend)
+        (self.p_bonds,
+         self.p_nodes,
+         self.q_bonds,
+         self.q_nodes,
          self.sigma) = builder.build_model()
 
     def compute_bond_kl(self, verbose=False):
@@ -539,6 +557,24 @@ class BTN:
                 result = full_tn.contract(output_inds=[self.batch_dim]+output_inds)
             
             return result
+        elif mode == 'substract':
+
+            full_tn = tn & inputs
+            prediction = full_tn.contract(output_inds=self.output_dimensions_unprimed + [self.batch_dim])
+            delta = prediction - y
+            if sum_over_batch:
+                result = delta.contract(output_inds=self.output_dimensions_unprimed)
+            return result
+            
+        elif mode == 'tau':
+            inds = output_inds
+            print(inds)
+            swap = {i: f"{i}_prime" for i in self.output_dimensions}
+            tau_mean = self.get_tau_mean()
+            new_y = y.reindex_(swap)
+            full_tn = tau_mean & tn & new_y & inputs
+            result = full_tn.contract(output_inds=inds)
+            return result
             
         elif mode == 'squared_error':
             # First compute forward using quimb
@@ -765,17 +801,43 @@ class BTN:
         return mu_forward
     
     def _get_tau_update(self):
-        concentration = self.p_tau.concentration + self.data.samples * 0.5
-        mse = self._calc_mu_mse()
-        sigma_f = self._calc_sigma_forward() 
-        rate = self.p_tau.rate + 0.5 * (mse + sigma_f)
-        return concentration, rate
+        df = self.p_tau.df + self.data.samples
+        mu_f = self.forward_with_target(self.data.data_mu_y, self.mu, sum_over_batch = True, mode = 'substract')
+        inds = mu_f.inds
+        mu_f_prime = self._prime_indices_tensor(mu_f.copy())
+        pinds = mu_f_prime.inds
+        mu_out = qt.TensorNetwork([mu_f, mu_f_prime])
+        mu_out = mu_out.contract(output_inds = inds + pinds)
+        sigma_f = self.forward(self.sigma, self.data.data_sigma,sum_over_batch=True, sum_over_output=False) 
+        q_precision = self.p_tau.precision + mu_out + sigma_f
+        
+        o_inds = self.output_dimensions_unprimed
+        po_inds = [i + '_prime' for i in o_inds]
+        map = {
+            'rows' : o_inds,
+            'cols': po_inds
+        }
+
+        sizes = tuple(q_precision.ind_size(i) for i in o_inds)
+
+        # # 3. Define the Shape Map (mapping fused index -> tuple of new sizes)
+        shape_map = {
+            'rows': sizes,
+            'cols': sizes
+        }
+        precision = q_precision.fuse(map, inplace=False)
+        matrix_data = precision.to_dense(['rows'], ['cols'])
+        tensor_q_covariance = self.invert_ordered_tensor(matrix_data)
+        q_covariance = qt.Tensor(tensor_q_covariance, ['rows', 'cols'])
+        q_covariance.unfuse(map, shape_map=shape_map,inplace=True)
+        return df, q_covariance, q_precision
 
     def update_tau(self):
-        concentration, rate = self._get_tau_update()
+        df, covariance, precision = self._get_tau_update()
         self.q_tau.update_parameters(
-                            concentration = concentration,
-                            rate = rate
+                            df= df,
+                            covariance = covariance,
+                            precision = precision
                          )
 
     def _get_partial_trace(self, node: qt.Tensor, node_tag, bond_tag):
@@ -830,11 +892,6 @@ class BTN:
         tau_expectation = self.get_tau_mean()
 
         variational_inds, output_inds, node_inds = self.get_variational_outputs_inds(self.mu[node_tag])
-        # Calculate output dimension size (product of all output dims for this node)
-        output_dim_size = 1
-        for out_ind in output_inds:
-            output_dim_size *= self.mu.ind_size(out_ind)
-
         # Compute environment terms (these sum over output, so we multiply by output_dim_size)
         sigma_env = self.get_environment(
                          tn =self.sigma,
@@ -842,14 +899,15 @@ class BTN:
                          input_generator=self.data.data_sigma,
                          copy=False,
                          sum_over_batch = True,
-                         sum_over_output=True
+                         sum_over_output=False
                      )
 
         mu_outer_env = self.outer_operation(
             tn=self.mu,
             node_tag=node_tag,
             input_generator=self.data.data_mu,
-            sum_over_batches=True
+            sum_over_batches=True,
+            sum_over_outputs=False
         )
         
         # Compute theta (bond prior contribution) - includes output dimensions
@@ -857,7 +915,7 @@ class BTN:
             node_tag=node_tag,
         )
 
-        for old_ind in variational_inds:
+        for old_ind in node_inds:
             primed_ind = old_ind + '_prime'
             # Expand the original index into the desired diagonal pair
             # The original values are placed along the diagonal of (old_ind, primed_ind)
@@ -867,11 +925,15 @@ class BTN:
         # sigma_env and mu_outer_env have structure [variational] + [variational_prime] (no output)
         # theta has structure [all_inds] + [all_inds_prime] (includes output with primes)
         # We need to add output × output_prime dimensions to match
-        second_moments = tau_expectation * output_dim_size * (sigma_env + mu_outer_env)
+        inds = self.sigma[node_tag].inds
+        sum = sigma_env + mu_outer_env
+        # print("SUM")
+        # print(sum.inds)
+        # print("TAU")
+        # print(tau_expectation.inds)
 
-        for out_ind in output_inds:
-            out_size = self.mu.ind_size(out_ind)
-            second_moments.new_ind(out_ind, out_size, mode='repeat')
+        second_moments = qt.TensorNetwork([tau_expectation, sum])
+        second_moments = second_moments.contract(output_inds = inds)
         precision = second_moments + theta
         
         return precision
@@ -880,21 +942,23 @@ class BTN:
         # All non-batch indices are now variational (including output!)
         variational_ind, output_ind, node_ind = self.get_variational_outputs_inds(self.mu[node_tag])
         precision = self.compute_precision_node(node_tag)
-        variational_ind_prime = [i + '_prime' for i in variational_ind]
-        map = {'o' : output_ind, 'rows' : variational_ind, 'cols': variational_ind_prime}
-        var_sizes = tuple(self.mu[node_tag].ind_size(i) for i in variational_ind)
-        out_sizes = tuple(self.mu[node_tag].ind_size(i) for i in output_ind)
+        ind_prime = [i + '_prime' for i in node_ind]
+        map = {
+            'rows' : node_ind,
+            'cols': ind_prime
+        }
+
+        sizes = tuple(self.mu[node_tag].ind_size(i) for i in node_ind)
 
         # 3. Define the Shape Map (mapping fused index -> tuple of new sizes)
         shape_map = {
-            'o': out_sizes,
-            'rows': var_sizes,
-            'cols': var_sizes  # 'cols' uses the same sizes as 'rows'
+            'rows': sizes,
+            'cols': sizes
         }
         precision.fuse(map, inplace=True)
-        matrix_data = precision.to_dense(['o'], ['rows'], ['cols'])
+        matrix_data = precision.to_dense(['rows'], ['cols'])
         tensor_sigma_node = self.invert_ordered_tensor(matrix_data)
-        sigma_node = qt.Tensor(tensor_sigma_node, ["o", 'rows', 'cols'], tags = node_tag)
+        sigma_node = qt.Tensor(tensor_sigma_node, ['rows', 'cols'], tags = node_tag)
         sigma_node.unfuse(map, shape_map=shape_map,inplace=True)
         return sigma_node
 
@@ -904,16 +968,16 @@ class BTN:
         rhs = self.forward_with_target(
             self.data.data_mu_y,
             self.mu,
-            'dot',
+            'tau',
             sum_over_batch = True,
             output_inds = mu_idx
         )
+
         relabel_map = {}
         for ind in variational_idx:
             relabel_map[ind] = ind + '_prime'
         
         rhs = rhs.reindex(relabel_map)
-        rhs = rhs * self.q_tau.mean()
         tn = rhs & self.sigma[node_tag]
 
         mu_update = tn.contract(output_inds=mu_idx)
@@ -1002,14 +1066,15 @@ class BTN:
         return inv_data
 
 
-    def outer_operation(self, input_generator, tn, node_tag, sum_over_batches):
+    def outer_operation(self, input_generator, tn, node_tag, sum_over_batches, sum_over_outputs):
         if sum_over_batches:
             result = self._sum_over_batches(
                 self._batch_outer_operation,
                 input_generator,
                 tn = tn,
                 node_tag = node_tag,
-                sum_over_batches=sum_over_batches
+                sum_over_batches=sum_over_batches,
+                sum_over_outputs=sum_over_outputs
             )
         else:
             result = self._concat_over_batches(
@@ -1017,11 +1082,12 @@ class BTN:
                 input_generator,
                 tn = tn,
                 node_tag = node_tag,
-                sum_over_batches=sum_over_batches
+                sum_over_batches=sum_over_batches,
+                sum_over_outputs=sum_over_outputs
             )
         return result
     
-    def _batch_outer_operation(self, inputs, tn, node_tag, sum_over_batches: bool):
+    def _batch_outer_operation(self, inputs, tn, node_tag, sum_over_batches: bool, sum_over_outputs: bool):
         """
         Compute the outer product of mu environment with itself, summed over batches:
         Σ_n (T_i μ x_n) ⊗ (T_i μ x_n)
@@ -1047,12 +1113,12 @@ class BTN:
             tn,
             target_tag=node_tag,
             sum_over_batch=False,
-            sum_over_output=True
+            sum_over_output=sum_over_outputs
         )
       
         sample_dim = [self.batch_dim] if not sum_over_batches else []
         # Prime indices (exclude output)
-        env_prime = self._prime_indices_tensor(env, exclude_indices=self.output_dimensions+[self.batch_dim])
+        env_prime = self._prime_indices_tensor(env, exclude_indices=[self.batch_dim])
         # Outer product via tensor network (sums over shared output indices)
 
         env_inds = env.inds + env_prime.inds
@@ -1191,29 +1257,6 @@ class BTN:
         return tensor.reindex(reindex_map)
 
     def fit(self, epochs, track_elbo=False, track_kl_components=False, trim_every_epochs = False, threshold = 1.1):
-        """
-        Train the model for a given number of epochs.
-        
-        Args:
-            epochs: Number of training iterations
-            track_elbo: If True, compute and track ELBO at each epoch (slower but informative)
-            track_kl_components: If True, also track detailed KL components (bond, node, tau)
-            trim_every_epochs: Frequency of bond trimming (False = no trimming, or int for frequency)
-            threshold: Threshold for bond trimming
-            
-        Returns:
-            dict: Training history containing:
-                - 'mse': List of MSE values per epoch
-                - 'tau_mean': List of E[τ] values per epoch
-                - 'tau_concentration': List of concentration parameters
-                - 'tau_rate': List of rate parameters
-                - 'elbo': List of ELBO values per epoch (if track_elbo=True)
-                - 'elbo_delta': List of ELBO changes per epoch (if track_elbo=True)
-                - 'bond_kl': List of bond KL per epoch (if track_kl_components=True)
-                - 'node_kl': List of node KL per epoch (if track_kl_components=True)
-                - 'tau_kl': List of tau KL per epoch (if track_kl_components=True)
-                - 'exp_log_lik': List of expected log likelihood per epoch (if track_kl_components=True)
-        """
         self.threshold = threshold
         bonds = [i for i in self.mu.ind_map if i != self.batch_dim]
         nodes = list(self.mu.tag_map.keys())
@@ -1224,75 +1267,9 @@ class BTN:
             if not trim_every_epochs:
                 trim_every_epochs = epochs + 1
         
-        # Initialize tracking dictionary
-        history = {
-            'epoch': [],
-            'mse': [],
-            'tau_mean': [],
-            'tau_concentration': [],
-            'tau_rate': []
-        }
-        
-        if track_elbo:
-            history['elbo'] = []
-            history['elbo_delta'] = []
-        
-        if track_kl_components:
-            history['bond_kl'] = []
-            history['node_kl'] = []
-            history['tau_kl'] = []
-            history['exp_log_lik'] = []
-        
-        # Compute initial ELBO if tracking
-        if track_elbo:
-            elbo_before = self.compute_elbo(verbose=False, print_components=False)
-            print(f"Initial ELBO (before training): {elbo_before:.4f}")
-            print("-" * 60)
-        
-        ctau = self.q_tau.concentration
-        rtau = self.q_tau.rate
-        mse = self._calc_mu_mse()/self.data.samples
-        tau_mean = self.get_tau_mean()
-        
-        history['epoch'].append(0)
-        history['mse'].append(float(mse.data))
-        history['tau_mean'].append(float(tau_mean))
-        history['tau_concentration'].append(float(ctau))
-        history['tau_rate'].append(float(rtau))
-        
-        # Track KL components if requested
-        if track_kl_components:
-            bond_kl = self.compute_bond_kl(verbose=False)
-            node_kl = self.compute_node_kl(verbose=False)
-            tau_kl = self.compute_tau_kl()
-            exp_log_lik = self.compute_expected_log_likelihood(verbose=False)
-            
-            # Ensure tau_kl is scalar
-            if isinstance(tau_kl, torch.Tensor):
-                tau_kl = tau_kl.item() if tau_kl.numel() == 1 else tau_kl.sum().item()
-            
-            history['bond_kl'].append(float(bond_kl))
-            history['node_kl'].append(float(node_kl))
-            history['tau_kl'].append(float(tau_kl))
-            history['exp_log_lik'].append(float(exp_log_lik))
-        
-        # Track ELBO and print progress
-        if track_elbo:
-            elbo_after_epoch = self.compute_elbo(verbose=False, print_components=False)
-            delta_elbo = 0
-            history['elbo'].append(float(elbo_after_epoch))
-            history['elbo_delta'].append(float(delta_elbo))
-            
-            status = "✓" if delta_elbo >= 0 else "✗"
-            print(f"Epoch {0}/{epochs} | MSE {mse.data:.4f}, E[τ] {tau_mean:.2f}, "
-                  f"ELBO {elbo_after_epoch:.4f} (Δ={delta_elbo:+.4f}) {status}")
-        else:
-            print(f"Epoch {0}/{epochs} | MSE {mse.data:.4f}, E[τ] {tau_mean:.2f}")
+
         for i in range(epochs):
             # Store ELBO before updates
-            if track_elbo:
-                elbo_before_epoch = self.compute_elbo(verbose=False, print_components=False)
-            
             # Perform all updates for this epoch
             for node_tag in nodes:
                 self.update_sigma_node(node_tag)
@@ -1300,58 +1277,7 @@ class BTN:
             for bond_tag in bonds:
                 self.update_bond(bond_tag)
             self.update_tau()
-            
-            # Compute and store metrics
-            ctau = self.q_tau.concentration
-            rtau = self.q_tau.rate
-            mse = self._calc_mu_mse()/self.data.samples
-            tau_mean = self.get_tau_mean()
-            
-            history['epoch'].append(i + 1)
-            history['mse'].append(float(mse.data))
-            history['tau_mean'].append(float(tau_mean))
-            history['tau_concentration'].append(float(ctau))
-            history['tau_rate'].append(float(rtau))
-            
-            # Track KL components if requested
-            if track_kl_components:
-                bond_kl = self.compute_bond_kl(verbose=False)
-                node_kl = self.compute_node_kl(verbose=False)
-                tau_kl = self.compute_tau_kl()
-                exp_log_lik = self.compute_expected_log_likelihood(verbose=False)
-                
-                # Ensure tau_kl is scalar
-                if isinstance(tau_kl, torch.Tensor):
-                    tau_kl = tau_kl.item() if tau_kl.numel() == 1 else tau_kl.sum().item()
-                
-                history['bond_kl'].append(float(bond_kl))
-                history['node_kl'].append(float(node_kl))
-                history['tau_kl'].append(float(tau_kl))
-                history['exp_log_lik'].append(float(exp_log_lik))
-            
-            # Trim bonds if needed
-            if (i + 1) % trim_every_epochs == 0:
-                self.trim_bonds()
-            
-            # Track ELBO and print progress
-            if track_elbo:
-                elbo_after_epoch = self.compute_elbo(verbose=False, print_components=False)
-                delta_elbo = elbo_after_epoch - elbo_before_epoch
-                history['elbo'].append(float(elbo_after_epoch))
-                history['elbo_delta'].append(float(delta_elbo))
-                
-                status = "✓" if delta_elbo >= 0 else "✗"
-                print(f"Epoch {i+1}/{epochs} | MSE {mse.data:.4f}, E[τ] {tau_mean:.2f}, "
-                      f"ELBO {elbo_after_epoch:.4f} (Δ={delta_elbo:+.4f}) {status}")
-            else:
-                print(f"Epoch {i+1}/{epochs} | MSE {mse.data:.4f}, E[τ] {tau_mean:.2f}")
-        
-        if track_elbo:
-            print("-" * 60)
-            print(f"Final ELBO: {history['elbo'][-1]:.4f}")
-            print(f"Total change: {history['elbo'][-1] - history['elbo'][0]:+.4f}")
-        
-        return history
+        return 
 
     def debug_print(self, node_tag=None, bond_tag=None):
         bonds = [i for i in self.mu.ind_map if i not in self.output_dimensions] if bond_tag is None else [bond_tag]

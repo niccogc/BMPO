@@ -118,6 +118,55 @@ class GammaDistribution:
         # Reset the cached distribution so it regenerates with new shape next time
         self._distribution = None
 
+class WishartDistribution:
+    """
+    Gamma distribution wrapper for PyTorch distributions.
+    Supports quimb.Tensor parameters and returns expectations as quimb.Tensors.
+    """
+    
+    def __init__(self, df, covariance, inds, precision = None, backend = 'torch'):
+        """
+        Initialize Gamma distribution.
+        
+        Args:
+            concentration: Shape parameter (alpha). Can be quimb.Tensor.
+            rate: Rate parameter (beta). Can be quimb.Tensor.
+        """
+        self.inds = inds
+        self.pinds = [i + '_prime' for i in inds]
+        self.backend = backend
+        self.df = df
+        self.covariance = covariance
+        self.precision = precision
+        self._distribution = None
+    
+    def update_parameters(self, df=None, precision=None, covariance=None):
+        if df is not None:
+            self.df= df
+        if precision is not None:
+            self.precision = precision
+        if covariance is not None:
+            self.covariance = covariance
+        self._distribution = None
+    
+    def forward(self):
+        if self._distribution is None:
+            df_data = _extract_data(self.df)
+            covariance_data = self.covariance.to_dense(self.inds, self.pinds)
+            self._distribution = dist.Wishart(df = df_data, covariance=covariance_data)
+        return self._distribution
+    
+    def mean(self):
+        """
+        Returns E[X] = alpha / beta.
+        If inputs are quimb.Tensors, returns a quimb.Tensor with the same bond indices.
+        """
+        df_data = _extract_data(self.df)
+        cov_data = _extract_data(self.covariance)
+        res = cov_data * df_data
+        return _wrap_if_quimb(res, self.covariance, self.backend)
+
+
 class MultivariateGaussianDistribution:
     """
     Multivariate Gaussian (Normal) distribution wrapper.
@@ -177,6 +226,3 @@ class MultivariateGaussianDistribution:
     def mean(self):
         """Returns the mean. If loc is a quimb.Tensor, returns it directly."""
         return self.loc
-
-
-

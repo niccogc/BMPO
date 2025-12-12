@@ -29,6 +29,7 @@ def test_polynomial_learning():
     
     # Add small noise
     y_raw += 0.1 * torch.randn_like(y_raw)
+    y_raw = torch.cat([y_raw, y_raw*2, y_raw*0.5], dim = 1)
 
     # ---------------------------------------------------------
     # 2. FEATURE ENGINEERING (Add constant)
@@ -89,7 +90,7 @@ def test_polynomial_learning():
     # Node 3: Bond 'b2', Input 'x3', Output 'y'
     # Output dimension is 1 (scalar regression)
     t3 = qt.Tensor(
-        data=init_weights((D_bond, D_phys, D_bond, 1)), 
+        data=init_weights((D_bond, D_phys, D_bond, 3)), 
         inds=('b2', 'x3', 'b3', 'y'), 
         tags={'Node3'}
     )
@@ -108,8 +109,7 @@ def test_polynomial_learning():
     )
 
     print(f"Model Initialized. Training on {N_SAMPLES} samples...")
-    print(f"Initial MSE: {model._calc_mu_mse().item():.6f}")
-
+    # print(model.sigma)
     # ---------------------------------------------------------
     # 4.5. TEST KL DIVERGENCE COMPUTATION (BEFORE TRAINING)
     # ---------------------------------------------------------
@@ -121,21 +121,21 @@ def test_polynomial_learning():
     bond_kl = model.compute_bond_kl()
     print(f"Total Bond KL: {bond_kl}")
     
-    print("\n--- Computing Node KL ---")
-    node_kl = model.compute_node_kl()
-    print(f"Total Node KL: {node_kl}")
+    # print("\n--- Computing Node KL ---")
+    # node_kl = model.compute_node_kl()
+    # print(f"Total Node KL: {node_kl}")
     
-    print("\n--- Computing Tau KL ---")
-    tau_kl = model.compute_tau_kl()
-    print(tau_kl)
+    # print("\n--- Computing Tau KL ---")
+    # tau_kl = model.compute_tau_kl()
+    # print(tau_kl)
     
-    print("\n--- Computing Expected Log Likelihood ---")
-    expected_log_lik = model.compute_expected_log_likelihood()
+    # print("\n--- Computing Expected Log Likelihood ---")
+    # expected_log_lik = model.compute_expected_log_likelihood()
     
-    print("\n--- Computing ELBO ---")
-    elbo = model.compute_elbo(verbose=True)
+    # print("\n--- Computing ELBO ---")
+    # elbo = model.compute_elbo(verbose=True)
     
-    print("\n" + "="*60)
+    # print("\n" + "="*60)
 
     # ---------------------------------------------------------
     # 5. TRAINING
